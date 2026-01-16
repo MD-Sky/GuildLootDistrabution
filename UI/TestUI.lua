@@ -9,14 +9,202 @@ NS.TestUI = TestUI
 local TEST_VOTERS = {
   { name = "Lily", class = "DRUID", armor = "Leather", weapon = "Staff" },
   { name = "Rob", class = "SHAMAN", armor = "Mail", weapon = "One-Handed Mace & Shield" },
+  { name = "Steph", class = "HUNTER", armor = "Mail", weapon = "Bow" },
   { name = "Alex", class = "WARLOCK", armor = "Cloth", weapon = "Staff" },
   { name = "Ryan", class = "DEATHKNIGHT", armor = "Plate", weapon = "Two-Handed Sword" },
   { name = "Vulthan", class = "WARRIOR", armor = "Plate", weapon = "Two-Handed Axe" },
 }
 
+local function GetTestVoter(index)
+  return TEST_VOTERS[index]
+end
+
 local function GetTestVoterName(index)
   local entry = TEST_VOTERS[index]
   return entry and entry.name or nil
+end
+
+local function NormalizeItemInput(itemLink)
+  if not itemLink or itemLink == "" then
+    return nil
+  end
+  local normalized = itemLink
+  local wowheadId = itemLink:match("item=(%d+)")
+  if wowheadId then
+    normalized = "item:" .. wowheadId
+  end
+  if not normalized:find("|Hitem:") and normalized:find("^item:%d+") then
+    normalized = "item:" .. normalized:match("item:(%d+)")
+  end
+  return normalized
+end
+
+local function IsEligibleForNeedSafe(classFile, itemLink)
+  if not classFile or not itemLink then
+    return false
+  end
+  local classID = C_Item.GetItemInfoInstant(itemLink)
+  if not classID then
+    GLD:RequestItemData(itemLink)
+    return true
+  end
+  return GLD:IsEligibleForNeed(classFile, itemLink)
+end
+
+local EQUIP_SLOT_LABELS = {
+  INVTYPE_HEAD = "Head",
+  INVTYPE_SHOULDER = "Shoulder",
+  INVTYPE_CHEST = "Chest",
+  INVTYPE_ROBE = "Chest",
+  INVTYPE_WAIST = "Waist",
+  INVTYPE_LEGS = "Legs",
+  INVTYPE_FEET = "Feet",
+  INVTYPE_WRIST = "Wrist",
+  INVTYPE_HAND = "Hands",
+  INVTYPE_CLOAK = "Back",
+}
+
+local ARMOR_SUBCLASS = {
+  [1] = "Cloth",
+  [2] = "Leather",
+  [3] = "Mail",
+  [4] = "Plate",
+}
+
+local ARMOR_SPECIAL = {
+  [0] = "Trinket",
+  [2] = "Neck",
+  [11] = "Ring",
+}
+
+local function GetArmorTypeOnly(itemLink)
+  if not itemLink then
+    return "-"
+  end
+  local classID, subClassID = C_Item.GetItemInfoInstant(itemLink)
+  if not classID then
+    GLD:RequestItemData(itemLink)
+    return "-"
+  end
+  if classID == 4 then
+    local armor = ARMOR_SPECIAL[subClassID] or ARMOR_SUBCLASS[subClassID]
+    if armor then
+      return armor
+    end
+  end
+  if classID == 2 then
+    return "Weapon"
+  end
+  local _, _, _, _, _, itemType, itemSubType = GetItemInfo(itemLink)
+  if itemType == "Armor" and itemSubType and itemSubType ~= "" then
+    return itemSubType
+  end
+  if itemType and itemType ~= "" then
+    return itemType
+  end
+  return "Other"
+end
+
+local function GetLootTypeText(itemLink)
+  if not itemLink then
+    return "-"
+  end
+  local classID, subClassID, _, equipLoc = C_Item.GetItemInfoInstant(itemLink)
+  if not classID then
+    return "-"
+  end
+  if classID == 4 then
+    local armor = ARMOR_SUBCLASS[subClassID] or "Armor"
+    local slot = EQUIP_SLOT_LABELS[equipLoc] or "Other"
+    return armor .. " " .. slot
+  end
+  if classID == 2 then
+    return "Weapon"
+  end
+  return "Other"
+end
+
+local function GetLootTypeDetailed(itemLink)
+  if not itemLink then
+    return "-"
+  end
+  local classID, subClassID, _, equipLoc = C_Item.GetItemInfoInstant(itemLink)
+  if not classID then
+    return "-"
+  end
+  if classID == 4 then
+    local armor = ARMOR_SPECIAL[subClassID] or ARMOR_SUBCLASS[subClassID] or "Armor"
+    local slot = EQUIP_SLOT_LABELS[equipLoc] or "Other"
+    return armor .. " " .. slot
+  end
+  if classID == 2 then
+    local _, _, _, _, _, itemType, itemSubType = GetItemInfo(itemLink)
+    if itemType == "Weapon" and itemSubType and itemSubType ~= "" then
+      return "Weapon - " .. itemSubType
+    end
+    return "Weapon"
+  end
+  local _, _, _, _, _, itemType = GetItemInfo(itemLink)
+  return itemType or "Other"
+end
+
+local function IsPreferredItemForEntry(entry, itemLink)
+  if not entry or not itemLink then
+    return false
+  end
+  if GLD.GetItemClassRestrictions then
+    local restriction = GLD:GetItemClassRestrictions(itemLink)
+    if restriction then
+      return restriction[entry.class] == true
+    end
+  end
+  local armorType = GetArmorTypeOnly(itemLink)
+  if armorType == "Cloth" or armorType == "Leather" or armorType == "Mail" or armorType == "Plate" then
+    return entry.armor == armorType
+  end
+  local _, _, _, _, _, itemType, itemSubType = GetItemInfo(itemLink)
+  if itemType == "Weapon" then
+    if not entry.weapon or not itemSubType then
+      return false
+    end
+    local pref = string.lower(entry.weapon)
+    local sub = string.lower(itemSubType)
+    if pref:find("bow") and sub:find("bow") then
+      return true
+    end
+    if pref:find("gun") and sub:find("gun") then
+      return true
+    end
+    if pref:find("crossbow") and sub:find("crossbow") then
+      return true
+    end
+    if pref:find("staff") and sub:find("staff") then
+      return true
+    end
+    if pref:find("polearm") and sub:find("polearm") then
+      return true
+    end
+    if pref:find("sword") and sub:find("sword") then
+      return true
+    end
+    if pref:find("axe") and sub:find("axe") then
+      return true
+    end
+    if pref:find("mace") and sub:find("mace") then
+      return true
+    end
+    if pref:find("dagger") and sub:find("dagger") then
+      return true
+    end
+    if pref:find("fist") and sub:find("fist") then
+      return true
+    end
+  end
+  return false
+end
+
+local function IsNeedAllowedForEntry(entry, itemLink)
+  return IsPreferredItemForEntry(entry, itemLink)
 end
 
 local function EJ_Call(name, ...)
@@ -39,6 +227,22 @@ end
 function TestUI:ResetTestVotes()
   self.testVotes = {}
   self.currentVoterIndex = 0
+end
+
+function TestUI:SetSelectedItemLink(itemLink)
+  if self.itemLinkInput and itemLink then
+    self.itemLinkInput:SetText(itemLink)
+  end
+  self:UpdateSelectedItemInfo()
+end
+
+function TestUI:UpdateSelectedItemInfo()
+  if not self.itemArmorLabel then
+    return
+  end
+  local itemLink = NormalizeItemInput(self.itemLinkInput and self.itemLinkInput:GetText() or nil)
+  local armorType = GetArmorTypeOnly(itemLink)
+  self.itemArmorLabel:SetText("Armor Type: " .. armorType)
 end
 
 function TestUI:ToggleTestPanel()
@@ -184,6 +388,11 @@ function TestUI:CreateTestFrame()
   itemLinkInput:SetText("item:19345")
   lootFrame:AddChild(itemLinkInput)
 
+  local itemArmorLabel = AceGUI:Create("Label")
+  itemArmorLabel:SetFullWidth(true)
+  itemArmorLabel:SetText("Armor Type: -")
+  lootFrame:AddChild(itemArmorLabel)
+
   local dropBtn = AceGUI:Create("Button")
   dropBtn:SetText("Simulate Loot Roll")
   dropBtn:SetWidth(150)
@@ -215,6 +424,7 @@ function TestUI:CreateTestFrame()
 
   self.encounterSelect = encounterSelect
   self.itemLinkInput = itemLinkInput
+  self.itemArmorLabel = itemArmorLabel
 
   instanceSelect:SetCallback("OnValueChanged", function(_, _, value)
     TestUI:SelectInstance(value)
@@ -225,6 +435,13 @@ function TestUI:CreateTestFrame()
   loadLootBtn:SetCallback("OnClick", function()
     TestUI:LoadEncounterLoot()
   end)
+  itemLinkInput:SetCallback("OnEnterPressed", function()
+    TestUI:UpdateSelectedItemInfo()
+  end)
+  itemLinkInput:SetCallback("OnTextChanged", function()
+    TestUI:UpdateSelectedItemInfo()
+  end)
+  self:UpdateSelectedItemInfo()
 end
 
 function TestUI:RefreshTestPanel()
@@ -341,7 +558,8 @@ function TestUI:RefreshVotePanel()
   end)
   self.voteScroll:AddChild(resetBtn)
 
-  local name = GetTestVoterName(self.currentVoterIndex + 1)
+  local currentEntry = GetTestVoter(self.currentVoterIndex + 1)
+  local name = currentEntry and currentEntry.name or nil
   if self.voteGroup then
     self.voteGroup:SetTitle("Test Vote Selection" .. (name and (" - " .. name) or ""))
   end
@@ -364,10 +582,19 @@ function TestUI:RefreshVotePanel()
   row:SetFullWidth(true)
   row:SetLayout("Flow")
 
+  local itemLink = NormalizeItemInput(self.itemLinkInput and self.itemLinkInput:GetText() or nil)
+  local canNeed = true
+  if itemLink and currentEntry and currentEntry.class then
+    canNeed = IsNeedAllowedForEntry(currentEntry, itemLink)
+  end
+
   local function addButton(text, vote)
     local btn = AceGUI:Create("Button")
     btn:SetText(text)
     btn:SetWidth(70)
+    if vote == "NEED" and not canNeed then
+      btn:SetDisabled(true)
+    end
     btn:SetCallback("OnClick", function()
       self.testVotes[name] = vote
       self.currentVoterIndex = self.currentVoterIndex + 1
@@ -396,14 +623,21 @@ function TestUI:RefreshResultsPanel()
 
   local header = AceGUI:Create("Label")
   header:SetFullWidth(true)
-  header:SetText("Results Panel Active")
+  header:SetText("Name | Choice | Loot Item Type | Class | Armor Type | Weapon Type")
   self.resultsScroll:AddChild(header)
 
+  local itemLink = NormalizeItemInput(self.itemLinkInput and self.itemLinkInput:GetText() or nil)
   local counts = { NEED = 0, GREED = 0, TRANSMOG = 0, PASS = 0 }
   for _, entry in ipairs(TEST_VOTERS) do
     local vote = self.testVotes[entry.name]
     if vote and counts[vote] then
-      counts[vote] = counts[vote] + 1
+      if vote == "NEED" and itemLink then
+        if IsNeedAllowedForEntry(entry, itemLink) then
+          counts[vote] = counts[vote] + 1
+        end
+      else
+        counts[vote] = counts[vote] + 1
+      end
     end
   end
 
@@ -426,21 +660,33 @@ function TestUI:RefreshResultsPanel()
   winnerLabel:SetText("Winner: (pending votes)")
   if allDone then
     local winner = nil
-    if counts.NEED > 0 then
+    local lootArmorType = GetArmorTypeOnly(itemLink)
+    if lootArmorType == "Cloth" or lootArmorType == "Leather" or lootArmorType == "Mail" or lootArmorType == "Plate" then
       for _, entry in ipairs(TEST_VOTERS) do
-        if self.testVotes[entry.name] == "NEED" then
+        if entry.armor == lootArmorType and self.testVotes[entry.name] == "NEED" and (not itemLink or IsNeedAllowedForEntry(entry, itemLink)) then
           winner = entry.name
           break
         end
       end
-    elseif counts.GREED > 0 then
+    end
+
+    if not winner and counts.NEED > 0 then
+      for _, entry in ipairs(TEST_VOTERS) do
+        if self.testVotes[entry.name] == "NEED" and (not itemLink or IsNeedAllowedForEntry(entry, itemLink)) then
+          winner = entry.name
+          break
+        end
+      end
+    end
+
+    if not winner and counts.GREED > 0 then
       for _, entry in ipairs(TEST_VOTERS) do
         if self.testVotes[entry.name] == "GREED" then
           winner = entry.name
           break
         end
       end
-    elseif counts.TRANSMOG > 0 then
+    elseif not winner and counts.TRANSMOG > 0 then
       for _, entry in ipairs(TEST_VOTERS) do
         if self.testVotes[entry.name] == "TRANSMOG" then
           winner = entry.name
@@ -448,14 +694,37 @@ function TestUI:RefreshResultsPanel()
         end
       end
     end
-    winnerLabel:SetText("Winner: " .. (winner or "None"))
+    local winnerArmor = "-"
+    if winner then
+      for _, entry in ipairs(TEST_VOTERS) do
+        if entry.name == winner then
+          winnerArmor = entry.armor or "-"
+          break
+        end
+      end
+    end
+    local lootTypeDetail = GetLootTypeDetailed(itemLink)
+    local lootArmorType = GetArmorTypeOnly(itemLink)
+    winnerLabel:SetText(string.format("Winner: %s | Armor: %s | Loot Armor: %s | Loot: %s", winner or "None", winnerArmor, lootArmorType, lootTypeDetail))
   end
   self.resultsScroll:AddChild(winnerLabel)
 
+  local lootType = GetLootTypeText(itemLink)
   for _, entry in ipairs(TEST_VOTERS) do
     local row = AceGUI:Create("Label")
     row:SetFullWidth(true)
-    row:SetText(string.format("%s -> %s", entry.name, self.testVotes[entry.name] or "-"))
+    local vote = self.testVotes[entry.name] or "-"
+    if vote == "NEED" and itemLink and not IsNeedAllowedForEntry(entry, itemLink) then
+      vote = "NEED (ineligible)"
+    end
+    row:SetText(string.format("%s | %s | %s | %s | %s | %s",
+      entry.name,
+      vote,
+      lootType,
+      entry.class,
+      entry.armor,
+      entry.weapon
+    ))
     self.resultsScroll:AddChild(row)
   end
 end
@@ -615,7 +884,7 @@ function TestUI:SelectEncounter(encounterID)
   end
 end
 
-function TestUI:LoadEncounterLoot()
+function TestUI:LoadEncounterLoot(retryCount)
   if not self.selectedEncounterIndex or not self.lootScroll then
     GLD:Print("LoadLoot: missing encounter or lootScroll")
     return
@@ -645,22 +914,55 @@ function TestUI:LoadEncounterLoot()
   end
 
   self.lootScroll:ReleaseChildren()
-    EJ_Call("SetLootFilter", 0)
-    EJ_Call("SetDifficultyID", 14)
-    if C_EncounterJournal and C_EncounterJournal.SetDifficultyID then
-      C_EncounterJournal.SetDifficultyID(14)
-    end
 
+  EJ_Call("SetLootFilter", 0)
+  if C_EncounterJournal and C_EncounterJournal.ResetLootFilter then
+    C_EncounterJournal.ResetLootFilter()
+  end
+  if _G.EJ_ResetLootFilter then
+    _G.EJ_ResetLootFilter()
+  end
+
+  EJ_Call("SetDifficultyID", 14)
+  if C_EncounterJournal and C_EncounterJournal.SetDifficultyID then
+    C_EncounterJournal.SetDifficultyID(14)
+  end
+
+  if self.selectedInstance then
+    EJ_Call("SelectInstance", self.selectedInstance)
+  end
   if encounterID then
     EJ_Call("SelectEncounter", encounterID)
+  elseif encounterIndex then
+    EJ_Call("SelectEncounter", encounterIndex)
   end
 
   GLD:Print("LoadLoot: encounterIndex=" .. tostring(encounterIndex) .. " encounterID=" .. tostring(encounterID))
 
+  local function GetLootInfoByIndex(index)
+    if C_EncounterJournal and C_EncounterJournal.GetLootInfoByIndex then
+      return C_EncounterJournal.GetLootInfoByIndex(index)
+    end
+    if _G.EJ_GetLootInfoByIndex then
+      return _G.EJ_GetLootInfoByIndex(index, encounterID or encounterIndex)
+    end
+    return nil
+  end
+
+  local numLoot = nil
+  if C_EncounterJournal and C_EncounterJournal.GetNumLoot then
+    numLoot = C_EncounterJournal.GetNumLoot()
+  elseif _G.EJ_GetNumLoot then
+    numLoot = _G.EJ_GetNumLoot()
+  end
+
   local index = 1
   local added = 0
   while true do
-    local itemInfo = { EJ_Call("GetLootInfoByIndex", index, encounterID or encounterIndex) }
+    if numLoot and index > numLoot then
+      break
+    end
+    local itemInfo = { GetLootInfoByIndex(index) }
     local info = itemInfo[1]
     if type(info) == "table" then
       itemInfo = info
@@ -697,7 +999,7 @@ function TestUI:LoadEncounterLoot()
     end)
     iconButton:SetCallback("OnClick", function()
       if itemLink then
-        self.itemLinkInput:SetText(itemLink)
+        self:SetSelectedItemLink(itemLink)
       end
     end)
     row:AddChild(iconButton)
@@ -721,7 +1023,7 @@ function TestUI:LoadEncounterLoot()
     end)
     nameLabel:SetCallback("OnClick", function()
       if itemLink then
-        self.itemLinkInput:SetText(itemLink)
+        self:SetSelectedItemLink(itemLink)
       end
     end)
     row:AddChild(nameLabel)
@@ -733,158 +1035,13 @@ function TestUI:LoadEncounterLoot()
   end
 
   GLD:Print("LoadLoot: items added=" .. tostring(added))
-  if added == 0 and encounterID and encounterID ~= encounterIndex then
-    local retryIndex = 1
-    while true do
-      local itemInfo = { EJ_Call("GetLootInfoByIndex", retryIndex, encounterIndex) }
-      local info = itemInfo[1]
-      if type(info) == "table" then
-        itemInfo = info
-      end
-      if not itemInfo[1] and type(info) ~= "table" then
-        break
-      end
-      local itemName, itemLink, itemQuality, itemLevel, _, _, _, _, icon = unpack(itemInfo)
-      if type(info) == "table" then
-        itemName = info.name or itemName
-        itemLink = info.link or info.itemLink or itemLink
-        itemLevel = info.itemLevel or itemLevel
-        icon = info.icon or info.texture or icon
-      end
-      local row = AceGUI:Create("SimpleGroup")
-      row:SetFullWidth(true)
-      row:SetLayout("Flow")
 
-      local iconButton = AceGUI:Create("Icon")
-      iconButton:SetImage(icon)
-      iconButton:SetImageSize(20, 20)
-      iconButton:SetWidth(24)
-      iconButton:SetHeight(24)
-      iconButton:SetCallback("OnEnter", function()
-        if itemLink then
-          GameTooltip:SetOwner(iconButton.frame, "ANCHOR_CURSOR")
-          GameTooltip:SetHyperlink(itemLink)
-          GameTooltip:Show()
-        end
-      end)
-      iconButton:SetCallback("OnLeave", function()
-        GameTooltip:Hide()
-      end)
-      iconButton:SetCallback("OnClick", function()
-        if itemLink then
-          self.itemLinkInput:SetText(itemLink)
-        end
-      end)
-      row:AddChild(iconButton)
-
-      local nameLabel = AceGUI:Create("InteractiveLabel")
-      local labelText = tostring(itemLink or itemName or "Unknown Item")
-      if itemLevel then
-        labelText = string.format("%s |cff999999(ilvl %s)|r", labelText, itemLevel)
-      end
-      nameLabel:SetText(labelText)
-      nameLabel:SetWidth(220)
-      nameLabel:SetCallback("OnEnter", function()
-        if itemLink then
-          GameTooltip:SetOwner(nameLabel.frame, "ANCHOR_CURSOR")
-          GameTooltip:SetHyperlink(itemLink)
-          GameTooltip:Show()
-        end
-      end)
-      nameLabel:SetCallback("OnLeave", function()
-        GameTooltip:Hide()
-      end)
-      nameLabel:SetCallback("OnClick", function()
-        if itemLink then
-          self.itemLinkInput:SetText(itemLink)
-        end
-      end)
-      row:AddChild(nameLabel)
-
-      self.lootScroll:AddChild(row)
-      added = added + 1
-      retryIndex = retryIndex + 1
-    end
-
-    GLD:Print("LoadLoot: fallback items added=" .. tostring(added))
-  end
-
-  if added == 0 and C_EncounterJournal and C_EncounterJournal.GetLootInfoByIndex then
-    local idx = 1
-    local added2 = 0
-    while true do
-      local itemInfo = { C_EncounterJournal.GetLootInfoByIndex(idx, encounterID) }
-      local info = itemInfo[1]
-      if type(info) == "table" then
-        itemInfo = info
-      end
-      if not itemInfo[1] and type(info) ~= "table" then
-        break
-      end
-
-      local itemName, itemLink, itemQuality, itemLevel, _, _, _, _, icon = unpack(itemInfo)
-      if type(info) == "table" then
-        itemName = info.name or itemName
-        itemLink = info.link or info.itemLink or itemLink
-        itemLevel = info.itemLevel or itemLevel
-        icon = info.icon or info.texture or icon
-      end
-      local row = AceGUI:Create("SimpleGroup")
-      row:SetFullWidth(true)
-      row:SetLayout("Flow")
-
-      local iconButton = AceGUI:Create("Icon")
-      iconButton:SetImage(icon)
-      iconButton:SetImageSize(20, 20)
-      iconButton:SetWidth(24)
-      iconButton:SetHeight(24)
-      iconButton:SetCallback("OnEnter", function()
-        if itemLink then
-          GameTooltip:SetOwner(iconButton.frame, "ANCHOR_CURSOR")
-          GameTooltip:SetHyperlink(itemLink)
-          GameTooltip:Show()
-        end
-      end)
-      iconButton:SetCallback("OnLeave", function()
-        GameTooltip:Hide()
-      end)
-      iconButton:SetCallback("OnClick", function()
-        if itemLink then
-          self.itemLinkInput:SetText(itemLink)
-        end
-      end)
-      row:AddChild(iconButton)
-
-      local nameLabel = AceGUI:Create("InteractiveLabel")
-      local labelText = tostring(itemLink or itemName or "Unknown Item")
-      if itemLevel then
-        labelText = string.format("%s |cff999999(ilvl %s)|r", labelText, itemLevel)
-      end
-      nameLabel:SetText(labelText)
-      nameLabel:SetWidth(220)
-      nameLabel:SetCallback("OnEnter", function()
-        if itemLink then
-          GameTooltip:SetOwner(nameLabel.frame, "ANCHOR_CURSOR")
-          GameTooltip:SetHyperlink(itemLink)
-          GameTooltip:Show()
-        end
-      end)
-      nameLabel:SetCallback("OnLeave", function()
-        GameTooltip:Hide()
-      end)
-      nameLabel:SetCallback("OnClick", function()
-        if itemLink then
-          self.itemLinkInput:SetText(itemLink)
-        end
-      end)
-      row:AddChild(nameLabel)
-
-      self.lootScroll:AddChild(row)
-      added2 = added2 + 1
-      idx = idx + 1
-    end
-
-    GLD:Print("LoadLoot: C_EncounterJournal items added=" .. tostring(added2))
+  retryCount = retryCount or 0
+  if added == 0 and retryCount < 5 then
+    GLD:Print("LoadLoot: no items yet, retrying " .. tostring(retryCount + 1))
+    C_Timer.After(0.3, function()
+      TestUI:LoadEncounterLoot(retryCount + 1)
+    end)
   end
 end
 
@@ -898,14 +1055,10 @@ function TestUI:SimulateLootRoll(itemLink)
     return
   end
 
-  local normalized = itemLink
-  local wowheadId = itemLink:match("item=(%d+)")
-  if wowheadId then
-    normalized = "item:" .. wowheadId
-  end
-
-  if not normalized:find("|Hitem:") and normalized:find("^item:%d+") then
-    normalized = "item:" .. normalized:match("item:(%d+)")
+  local normalized = NormalizeItemInput(itemLink)
+  if not normalized then
+    GLD:Print("Please enter an item link")
+    return
   end
 
   if normalized:find("^item:%d+") then
@@ -918,6 +1071,12 @@ function TestUI:SimulateLootRoll(itemLink)
   local displayLink = link or normalized
   local displayName = name or "Test Item"
 
+  local voterEntry = GetTestVoter((self.currentVoterIndex or 0) + 1)
+  local canNeed = true
+  if voterEntry and voterEntry.class then
+    canNeed = IsNeedAllowedForEntry(voterEntry, normalized)
+  end
+
   local rollID = math.random(1, 10000)
   local rollTime = 120
 
@@ -927,7 +1086,7 @@ function TestUI:SimulateLootRoll(itemLink)
     itemLink = displayLink,
     itemName = displayName,
     quality = quality or 4,
-    canNeed = true,
+    canNeed = canNeed,
     canGreed = true,
     canTransmog = true,
     votes = {},

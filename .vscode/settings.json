@@ -37,6 +37,13 @@
         "NUM_CHAT_WINDOWS",
         "ChatEdit_GetActiveWindow",
         "EncounterJournal",
-        "EncounterJournal_LoadUI"
+        "EncounterJournal_LoadUI",
+        "LOCALIZED_CLASS_NAMES_MALE",
+        "LOCALIZED_CLASS_NAMES_FEMALE",
+        "ITEM_CLASSES_ALLOWED",
+        "ALL",
+        "LOOT_ROLL_TYPE_NEED",
+        "LOOT_ROLL_TYPE_GREED",
+        "LOOT_ROLL_TYPE_PASS"
     ]
 }

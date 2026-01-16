@@ -393,6 +393,16 @@ function UI:ShowRollPopup(session)
   end)
   frame:AddChild(itemLabel)
 
+  local intentLabel = AceGUI:Create("Label")
+  intentLabel:SetFullWidth(true)
+  intentLabel:SetText("Declare your intent here. Please mirror your choice in the Blizzard roll window.")
+  frame:AddChild(intentLabel)
+
+  local waitLabel = AceGUI:Create("Label")
+  waitLabel:SetFullWidth(true)
+  waitLabel:SetText("")
+  frame:AddChild(waitLabel)
+
   local buttons = {
     { label = "Need", vote = "NEED" },
     { label = "Greed", vote = "GREED" },
@@ -404,6 +414,15 @@ function UI:ShowRollPopup(session)
     local button = AceGUI:Create("Button")
     button:SetText(btn.label)
     button:SetWidth(90)
+    if btn.vote == "NEED" and session.canNeed == false then
+      button:SetDisabled(true)
+    end
+    if btn.vote == "GREED" and session.canGreed == false then
+      button:SetDisabled(true)
+    end
+    if btn.vote == "TRANSMOG" and session.canTransmog == false then
+      button:SetDisabled(true)
+    end
     button:SetCallback("OnClick", function()
       session.votes = session.votes or {}
       local key = NS:GetPlayerKeyFromUnit("player")
@@ -412,6 +431,18 @@ function UI:ShowRollPopup(session)
         rollID = session.rollID,
         vote = btn.vote,
       }, "RAID")
+      if session.locked then
+        GLD:Print("Result locked. Your vote was recorded but the outcome is final.")
+      end
+      if btn.vote == "NEED" then
+        waitLabel:SetText("WAIT FOR EVERYONE TO VOTE TO FIND THE WINNER")
+        for _, child in ipairs(frame.children or {}) do
+          if child.type == "Button" then
+            child:SetDisabled(true)
+          end
+        end
+        return
+      end
       frame:Hide()
       if NS.TestUI and session.testVoterName then
         NS.TestUI.testVotes[session.testVoterName] = btn.vote

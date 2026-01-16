@@ -9,6 +9,7 @@ NS.MSG = {
   ROLL_SESSION = "ROLL_SESSION",
   ROLL_VOTE = "ROLL_VOTE",
   ROLL_RESULT = "ROLL_RESULT",
+  ROLL_MISMATCH = "ROLL_MISMATCH",
 }
 
 local function SafeGetLib(name)

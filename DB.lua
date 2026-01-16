@@ -18,6 +18,7 @@ local function InitMasterDB()
   GuildLootDB.config = GuildLootDB.config or DEFAULT_CONFIG
   GuildLootDB.players = GuildLootDB.players or {}
   GuildLootDB.queue = GuildLootDB.queue or {}
+  GuildLootDB.rollHistory = GuildLootDB.rollHistory or {}
   GuildLootDB.session = GuildLootDB.session or {
     active = false,
     startedAt = 0,
