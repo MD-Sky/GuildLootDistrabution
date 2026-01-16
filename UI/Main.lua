@@ -147,6 +147,55 @@ function UI:CreateMainFrame()
   self.scroll = scroll
 end
 
+function UI:CreatePendingFrame()
+  local frame = AceGUI:Create("Frame")
+  frame:SetTitle("Pending Votes")
+  frame:SetStatusText("Waiting on votes")
+  frame:SetWidth(420)
+  frame:SetHeight(260)
+  frame:SetLayout("Fill")
+  frame:EnableResize(false)
+  if frame.frame and frame.frame.SetBackdrop then
+    frame.frame:SetBackdrop({
+      bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
+      edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+      tile = true,
+      tileSize = 8,
+      edgeSize = 10,
+      insets = { left = 2, right = 2, top = 2, bottom = 2 },
+    })
+    frame.frame:SetBackdropColor(0, 0, 0, 1)
+  end
+
+  if frame.frame then
+    frame.frame:ClearAllPoints()
+    local width = UIParent and UIParent:GetWidth() or 0
+    frame.frame:SetPoint("CENTER", UIParent, "CENTER", -(width * 0.25), 0)
+  end
+
+  local pendingScroll = AceGUI:Create("ScrollFrame")
+  pendingScroll:SetLayout("Flow")
+  frame:AddChild(pendingScroll)
+
+  self.pendingFrame = frame
+  self.pendingScroll = pendingScroll
+end
+
+function UI:TogglePendingFrame()
+  if not self.pendingFrame then
+    self:CreatePendingFrame()
+    self.pendingFrame:Show()
+    self:RefreshPendingVotes()
+    return
+  end
+  if self.pendingFrame:IsShown() then
+    self.pendingFrame:Hide()
+  else
+    self.pendingFrame:Show()
+    self:RefreshPendingVotes()
+  end
+end
+
 function UI:RefreshMain()
   if not self.mainFrame then
     return
@@ -176,6 +225,129 @@ function UI:RefreshMain()
   for _, entry in ipairs(entries) do
     self:AddRosterRow(entry, isAdmin)
     self:AddDivider()
+  end
+end
+
+function UI:RefreshPendingVotes()
+  if not self.pendingFrame or not self.pendingFrame:IsShown() or not self.pendingScroll then
+    return
+  end
+
+  self.pendingScroll:ReleaseChildren()
+
+  local rolls = {}
+  for rollID, session in pairs(GLD.activeRolls or {}) do
+    if session and not session.locked then
+      rolls[#rolls + 1] = session
+    end
+  end
+  table.sort(rolls, function(a, b)
+    return (a.createdAt or 0) < (b.createdAt or 0)
+  end)
+
+  if #rolls == 0 then
+    local emptyLabel = AceGUI:Create("Label")
+    emptyLabel:SetFullWidth(true)
+    emptyLabel:SetText("No active loot votes.")
+    self.pendingScroll:AddChild(emptyLabel)
+    return
+  end
+
+  local function getNameAndClass(key)
+    if not key then
+      return "?", nil
+    end
+    local player = GLD.db and GLD.db.players and GLD.db.players[key]
+    if player and player.name then
+      return player.name, player.class
+    end
+    local name = NS:GetNameRealmFromKey(key)
+    if name then
+      return name, nil
+    end
+    return tostring(key), nil
+  end
+
+  local function colorizeName(name, classFile)
+    if not name then
+      return "?"
+    end
+    if classFile and RAID_CLASS_COLORS and RAID_CLASS_COLORS[classFile] then
+      local c = RAID_CLASS_COLORS[classFile]
+      return string.format("|cff%02x%02x%02x%s|r", c.r * 255, c.g * 255, c.b * 255, name)
+    end
+    return name
+  end
+
+  for _, session in ipairs(rolls) do
+    local expected = session.expectedVoters or {}
+    local votes = session.votes or {}
+    local pending = {}
+    for _, key in ipairs(expected) do
+      if not votes[key] then
+        local name, classFile = getNameAndClass(key)
+        pending[#pending + 1] = colorizeName(name, classFile)
+      end
+    end
+
+    local row = AceGUI:Create("SimpleGroup")
+    row:SetFullWidth(true)
+    row:SetLayout("Flow")
+
+    local icon = "Interface\\Icons\\INV_Misc_QuestionMark"
+    if session.itemLink then
+      local itemIcon = select(10, GetItemInfo(session.itemLink))
+      if itemIcon then
+        icon = itemIcon
+      else
+        GLD:RequestItemData(session.itemLink)
+      end
+    end
+
+    local iconWidget = AceGUI:Create("Icon")
+    iconWidget:SetImage(icon)
+    iconWidget:SetImageSize(28, 28)
+    iconWidget:SetWidth(32)
+    iconWidget:SetHeight(32)
+    iconWidget:SetCallback("OnEnter", function()
+      local link = session.itemLink
+      if link and link ~= "" then
+        GameTooltip:SetOwner(iconWidget.frame, "ANCHOR_CURSOR")
+        GameTooltip:SetHyperlink(link)
+        GameTooltip:Show()
+      end
+    end)
+    iconWidget:SetCallback("OnLeave", function()
+      GameTooltip:Hide()
+    end)
+    row:AddChild(iconWidget)
+
+    local itemLabel = AceGUI:Create("InteractiveLabel")
+    itemLabel:SetText(session.itemLink or session.itemName or "Unknown Item")
+    itemLabel:SetWidth(190)
+    itemLabel:SetCallback("OnEnter", function()
+      local link = session.itemLink
+      if link and link ~= "" then
+        GameTooltip:SetOwner(itemLabel.frame, "ANCHOR_CURSOR")
+        GameTooltip:SetHyperlink(link)
+        GameTooltip:Show()
+      end
+    end)
+    itemLabel:SetCallback("OnLeave", function()
+      GameTooltip:Hide()
+    end)
+    row:AddChild(itemLabel)
+
+    local waitingLabel = AceGUI:Create("Label")
+    waitingLabel:SetWidth(180)
+    if #pending == 0 then
+      waitingLabel:SetText("|cffaaaaaaWaiting: none|r")
+    else
+      waitingLabel:SetText("|cffaaaaaaWaiting: " .. table.concat(pending, ", ") .. "|r")
+    end
+    row:AddChild(waitingLabel)
+
+    self.pendingScroll:AddChild(row)
   end
 end
 
@@ -430,18 +602,24 @@ function UI:ShowRollPopup(session)
       session.votes = session.votes or {}
       local key = NS:GetPlayerKeyFromUnit("player")
       session.votes[key] = btn.vote
+      if self.RefreshPendingVotes then
+        self:RefreshPendingVotes()
+      end
+
       if not session.isTest then
         local authority = GLD:GetAuthorityName()
         if authority and not GLD:IsAuthority() then
           GLD:SendCommMessageSafe(NS.MSG.ROLL_VOTE, {
             rollID = session.rollID,
             vote = btn.vote,
+            voterKey = key,
           }, "WHISPER", authority)
         else
           local channel = IsInRaid() and "RAID" or (IsInGroup() and "PARTY" or "SAY")
           GLD:SendCommMessageSafe(NS.MSG.ROLL_VOTE, {
             rollID = session.rollID,
             vote = btn.vote,
+            voterKey = key,
           }, channel)
         end
       else
@@ -449,6 +627,7 @@ function UI:ShowRollPopup(session)
         GLD:SendCommMessageSafe(NS.MSG.ROLL_VOTE, {
           rollID = session.rollID,
           vote = btn.vote,
+          voterKey = key,
         }, channel)
       end
       if session.locked then

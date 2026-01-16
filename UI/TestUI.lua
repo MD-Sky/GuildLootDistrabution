@@ -521,6 +521,18 @@ function TestUI:CreateTestFrame()
   end)
   lootFrame:AddChild(dropBtn)
 
+  local pendingBtn = AceGUI:Create("Button")
+  pendingBtn:SetText("Show Pending Votes UI")
+  pendingBtn:SetWidth(180)
+  pendingBtn:SetCallback("OnClick", function()
+    if GLD.UI then
+      if GLD.UI.TogglePendingFrame then
+        GLD.UI:TogglePendingFrame()
+      end
+    end
+  end)
+  lootFrame:AddChild(pendingBtn)
+
   local lootListGroup = AceGUI:Create("InlineGroup")
   lootListGroup:SetTitle("Encounter Loot")
   lootListGroup:SetFullWidth(true)

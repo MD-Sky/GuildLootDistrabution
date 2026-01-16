@@ -279,21 +279,57 @@ function GLD:HandleRollSession(sender, payload)
   if isTest and self.UI then
     self.UI:ShowRollPopup(session)
   end
+
+  if self.UI and self.UI.RefreshPendingVotes then
+    self.UI:RefreshPendingVotes()
+  end
 end
 
 function GLD:HandleRollVote(sender, payload)
-  if not self:IsAuthority() or not payload or not payload.rollID then
+  if not payload or not payload.rollID then
     return
   end
+
+  local authority = self:GetAuthorityName()
+  local isAuthority = self:IsAuthority()
+  if not isAuthority and sender ~= authority then
+    return
+  end
+
+  if isAuthority and payload.broadcast then
+    return
+  end
+
   local rollID = payload.rollID
   local session = self.activeRolls and self.activeRolls[rollID] or nil
   if not session or session.locked then
     return
   end
-  local key = self:GetRollCandidateKey(sender)
+
+  local key = payload.voterKey or payload.voterName or self:GetRollCandidateKey(sender)
+  if not key then
+    return
+  end
+
   session.votes = session.votes or {}
   session.votes[key] = payload.vote
-  self:CheckRollCompletion(session)
+
+  if isAuthority then
+    self:CheckRollCompletion(session)
+    local channel = IsInRaid() and "RAID" or (IsInGroup() and "PARTY" or "SAY")
+    if channel ~= "SAY" then
+      self:SendCommMessageSafe(NS.MSG.ROLL_VOTE, {
+        rollID = rollID,
+        vote = payload.vote,
+        voterKey = key,
+        broadcast = true,
+      }, channel)
+    end
+  end
+
+  if self.UI and self.UI.RefreshPendingVotes then
+    self.UI:RefreshPendingVotes()
+  end
 end
 
 function GLD:HandleRollResult(sender, payload)
@@ -309,6 +345,9 @@ function GLD:HandleRollResult(sender, payload)
   self:Print("GLD Result: " .. tostring(payload.itemName or payload.itemLink or "Item") .. " -> " .. tostring(payload.winnerName or "None"))
   if self.UI and self.UI.ShowRollResultPopup then
     self.UI:ShowRollResultPopup(payload)
+  end
+  if self.UI and self.UI.RefreshPendingVotes then
+    self.UI:RefreshPendingVotes()
   end
 end
 
