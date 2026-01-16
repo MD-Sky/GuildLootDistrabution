@@ -366,7 +366,11 @@ function UI:ShowRollPopup(session)
   end
 
   local frame = AceGUI:Create("Frame")
-  frame:SetTitle("Loot Roll")
+  if session.testVoterName then
+    frame:SetTitle("Loot Roll - " .. session.testVoterName)
+  else
+    frame:SetTitle("Loot Roll")
+  end
   frame:SetStatusText(session.itemName or "Item")
   frame:SetWidth(400)
   frame:SetHeight(240)
@@ -409,6 +413,10 @@ function UI:ShowRollPopup(session)
         vote = btn.vote,
       }, "RAID")
       frame:Hide()
+      if NS.TestUI and session.testVoterName then
+        NS.TestUI.testVotes[session.testVoterName] = btn.vote
+        NS.TestUI:AdvanceTestVoter()
+      end
     end)
     frame:AddChild(button)
   end

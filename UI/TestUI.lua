@@ -6,6 +6,19 @@ local AceGUI = LibStub("AceGUI-3.0", true)
 local TestUI = {}
 NS.TestUI = TestUI
 
+local TEST_VOTERS = {
+  { name = "Lily", class = "DRUID", armor = "Leather", weapon = "Staff" },
+  { name = "Rob", class = "SHAMAN", armor = "Mail", weapon = "One-Handed Mace & Shield" },
+  { name = "Alex", class = "WARLOCK", armor = "Cloth", weapon = "Staff" },
+  { name = "Ryan", class = "DEATHKNIGHT", armor = "Plate", weapon = "Two-Handed Sword" },
+  { name = "Vulthan", class = "WARRIOR", armor = "Plate", weapon = "Two-Handed Axe" },
+}
+
+local function GetTestVoterName(index)
+  local entry = TEST_VOTERS[index]
+  return entry and entry.name or nil
+end
+
 local function EJ_Call(name, ...)
   if C_EncounterJournal and C_EncounterJournal[name] then
     return C_EncounterJournal[name](...)
@@ -19,6 +32,13 @@ end
 
 function GLD:InitTestUI()
   TestUI.testFrame = nil
+  TestUI.testVotes = {}
+  TestUI.currentVoterIndex = 0
+end
+
+function TestUI:ResetTestVotes()
+  self.testVotes = {}
+  self.currentVoterIndex = 0
 end
 
 function TestUI:ToggleTestPanel()
@@ -32,7 +52,9 @@ function TestUI:ToggleTestPanel()
   if self.testFrame:IsShown() then
     self.testFrame:Hide()
   else
+    self:ResetTestVotes()
     self.testFrame:Show()
+    GLD:Print("Test panel opened")
     self:RefreshTestPanel()
   end
 end
@@ -52,17 +74,10 @@ function TestUI:CreateTestFrame()
   columns:SetLayout("Flow")
   frame:AddChild(columns)
 
-  local lootColumn = AceGUI:Create("InlineGroup")
-  lootColumn:SetTitle("Test Loot Choices")
-  lootColumn:SetWidth(300)
-  lootColumn:SetFullHeight(true)
-  lootColumn:SetLayout("Flow")
-  columns:AddChild(lootColumn)
-
-  local rightColumn = AceGUI:Create("SimpleGroup")
-  rightColumn:SetWidth(580)
-  rightColumn:SetFullHeight(true)
-  rightColumn:SetLayout("Flow")
+  local rightColumn = AceGUI:Create("ScrollFrame")
+  rightColumn:SetFullWidth(true)
+  rightColumn:SetHeight(520)
+  rightColumn:SetLayout("List")
   columns:AddChild(rightColumn)
 
   local sessionGroup = AceGUI:Create("SimpleGroup")
@@ -106,30 +121,68 @@ function TestUI:CreateTestFrame()
 
   local rosterScroll = AceGUI:Create("ScrollFrame")
   rosterScroll:SetFullWidth(true)
-  rosterScroll:SetHeight(300)
+  rosterScroll:SetHeight(180)
   rosterScroll:SetLayout("Flow")
   rightColumn:AddChild(rosterScroll)
+
+  local voteGroup = AceGUI:Create("InlineGroup")
+  voteGroup:SetTitle("Test Vote Selection")
+  voteGroup:SetFullWidth(true)
+  voteGroup:SetHeight(170)
+  voteGroup:SetLayout("Fill")
+
+  local voteScroll = AceGUI:Create("ScrollFrame")
+  voteScroll:SetFullWidth(true)
+  voteScroll:SetHeight(160)
+  voteScroll:SetLayout("Flow")
+  voteGroup:AddChild(voteScroll)
+  rightColumn:AddChild(voteGroup)
+
+  local resultsGroup = AceGUI:Create("InlineGroup")
+  resultsGroup:SetTitle("Loot Distribution (Test)")
+  resultsGroup:SetFullWidth(true)
+  resultsGroup:SetHeight(170)
+  resultsGroup:SetLayout("Fill")
+
+  local resultsScroll = AceGUI:Create("ScrollFrame")
+  resultsScroll:SetFullWidth(true)
+  resultsScroll:SetHeight(140)
+  resultsScroll:SetLayout("Flow")
+  resultsGroup:AddChild(resultsScroll)
+  rightColumn:AddChild(resultsGroup)
+
+  local lootFrame = AceGUI:Create("Frame")
+  lootFrame:SetTitle("Test Loot Choices")
+  lootFrame:SetStatusText("Loot")
+  lootFrame:SetWidth(320)
+  lootFrame:SetHeight(560)
+  lootFrame:SetLayout("Flow")
+  lootFrame:EnableResize(false)
+  if lootFrame.frame then
+    lootFrame.frame:ClearAllPoints()
+    lootFrame.frame:SetPoint("RIGHT", frame.frame, "LEFT", -10, 0)
+  end
 
   local instanceSelect = AceGUI:Create("Dropdown")
   instanceSelect:SetLabel("Raid")
   instanceSelect:SetWidth(260)
-  lootColumn:AddChild(instanceSelect)
+  lootFrame:AddChild(instanceSelect)
 
   local encounterSelect = AceGUI:Create("Dropdown")
   encounterSelect:SetLabel("Encounter")
   encounterSelect:SetWidth(260)
-  lootColumn:AddChild(encounterSelect)
+  lootFrame:AddChild(encounterSelect)
 
   local loadLootBtn = AceGUI:Create("Button")
   loadLootBtn:SetText("Load Loot")
   loadLootBtn:SetWidth(120)
-  lootColumn:AddChild(loadLootBtn)
+  lootFrame:AddChild(loadLootBtn)
 
   local itemLinkInput = AceGUI:Create("EditBox")
   itemLinkInput:SetLabel("Item Link")
   itemLinkInput:SetWidth(260)
   itemLinkInput:SetText("item:19345")
-  lootColumn:AddChild(itemLinkInput)
+  lootFrame:AddChild(itemLinkInput)
 
   local dropBtn = AceGUI:Create("Button")
   dropBtn:SetText("Simulate Loot Roll")
@@ -137,7 +190,7 @@ function TestUI:CreateTestFrame()
   dropBtn:SetCallback("OnClick", function()
     TestUI:SimulateLootRoll(itemLinkInput:GetText())
   end)
-  lootColumn:AddChild(dropBtn)
+  lootFrame:AddChild(dropBtn)
 
   local lootListGroup = AceGUI:Create("InlineGroup")
   lootListGroup:SetTitle("Encounter Loot")
@@ -147,13 +200,18 @@ function TestUI:CreateTestFrame()
   local lootScroll = AceGUI:Create("ScrollFrame")
   lootScroll:SetLayout("Flow")
   lootListGroup:AddChild(lootScroll)
-  lootColumn:AddChild(lootListGroup)
+  lootFrame:AddChild(lootListGroup)
 
   self.testFrame = frame
   self.sessionStatus = sessionStatus
   self.rosterScroll = rosterScroll
+  self.voteGroup = voteGroup
+  self.voteScroll = voteScroll
+  self.resultsGroup = resultsGroup
+  self.resultsScroll = resultsScroll
   self.lootScroll = lootScroll
   self.instanceSelect = instanceSelect
+  self.lootFrame = lootFrame
 
   self.encounterSelect = encounterSelect
   self.itemLinkInput = itemLinkInput
@@ -178,6 +236,8 @@ function TestUI:RefreshTestPanel()
   self.sessionStatus:SetText("Session Status: " .. (sessionActive and "|cff00ff00ACTIVE|r" or "|cffff0000INACTIVE|r"))
 
   self.rosterScroll:ReleaseChildren()
+
+  GLD:Print("RefreshTestPanel: resultsScroll=" .. tostring(self.resultsScroll))
 
   local list = {}
   for _, player in pairs(GLD.db.players) do
@@ -250,6 +310,154 @@ function TestUI:RefreshTestPanel()
   end
 
   self:RefreshInstanceList()
+  self:RefreshVotePanel()
+  self:RefreshResultsPanel()
+end
+
+function TestUI:RefreshVotePanel()
+  if not self.voteScroll then
+    return
+  end
+
+  if self.currentVoterIndex == nil or self.currentVoterIndex < 0 then
+    self.currentVoterIndex = 0
+  end
+
+  self.voteScroll:ReleaseChildren()
+  GLD:Print("RefreshVotePanel: index=" .. tostring(self.currentVoterIndex))
+
+  local debugLabel = AceGUI:Create("Label")
+  debugLabel:SetFullWidth(true)
+  debugLabel:SetText("Test vote panel active")
+  self.voteScroll:AddChild(debugLabel)
+
+  local resetBtn = AceGUI:Create("Button")
+  resetBtn:SetText("Reset Votes")
+  resetBtn:SetWidth(120)
+  resetBtn:SetCallback("OnClick", function()
+    self:ResetTestVotes()
+    self:RefreshVotePanel()
+    self:RefreshResultsPanel()
+  end)
+  self.voteScroll:AddChild(resetBtn)
+
+  local name = GetTestVoterName(self.currentVoterIndex + 1)
+  if self.voteGroup then
+    self.voteGroup:SetTitle("Test Vote Selection" .. (name and (" - " .. name) or ""))
+  end
+  GLD:Print("Test vote current player=" .. tostring(name))
+  if not name then
+    local doneLabel = AceGUI:Create("Label")
+    doneLabel:SetFullWidth(true)
+    doneLabel:SetText("All test votes recorded.")
+    self.voteScroll:AddChild(doneLabel)
+    self:RefreshResultsPanel()
+    return
+  end
+
+  local header = AceGUI:Create("Heading")
+  header:SetFullWidth(true)
+  header:SetText("Player: " .. name)
+  self.voteScroll:AddChild(header)
+
+  local row = AceGUI:Create("SimpleGroup")
+  row:SetFullWidth(true)
+  row:SetLayout("Flow")
+
+  local function addButton(text, vote)
+    local btn = AceGUI:Create("Button")
+    btn:SetText(text)
+    btn:SetWidth(70)
+    btn:SetCallback("OnClick", function()
+      self.testVotes[name] = vote
+      self.currentVoterIndex = self.currentVoterIndex + 1
+      GLD:Print("Test vote: " .. tostring(name) .. " -> " .. tostring(vote) .. " (next index=" .. tostring(self.currentVoterIndex) .. ")")
+      self:RefreshVotePanel()
+      self:RefreshResultsPanel()
+    end)
+    row:AddChild(btn)
+  end
+
+  addButton("Need", "NEED")
+  addButton("Greed", "GREED")
+  addButton("Mog", "TRANSMOG")
+  addButton("Pass", "PASS")
+
+  self.voteScroll:AddChild(row)
+  self:RefreshResultsPanel()
+end
+
+function TestUI:RefreshResultsPanel()
+  if not self.resultsScroll then
+    return
+  end
+
+  self.resultsScroll:ReleaseChildren()
+
+  local header = AceGUI:Create("Label")
+  header:SetFullWidth(true)
+  header:SetText("Results Panel Active")
+  self.resultsScroll:AddChild(header)
+
+  local counts = { NEED = 0, GREED = 0, TRANSMOG = 0, PASS = 0 }
+  for _, entry in ipairs(TEST_VOTERS) do
+    local vote = self.testVotes[entry.name]
+    if vote and counts[vote] then
+      counts[vote] = counts[vote] + 1
+    end
+  end
+
+  local summary = AceGUI:Create("Label")
+  summary:SetFullWidth(true)
+  summary:SetText(string.format("Need: %d | Greed: %d | Mog: %d | Pass: %d",
+    counts.NEED, counts.GREED, counts.TRANSMOG, counts.PASS))
+  self.resultsScroll:AddChild(summary)
+
+  local allDone = true
+  for _, entry in ipairs(TEST_VOTERS) do
+    if not self.testVotes[entry.name] then
+      allDone = false
+      break
+    end
+  end
+
+  local winnerLabel = AceGUI:Create("Label")
+  winnerLabel:SetFullWidth(true)
+  winnerLabel:SetText("Winner: (pending votes)")
+  if allDone then
+    local winner = nil
+    if counts.NEED > 0 then
+      for _, entry in ipairs(TEST_VOTERS) do
+        if self.testVotes[entry.name] == "NEED" then
+          winner = entry.name
+          break
+        end
+      end
+    elseif counts.GREED > 0 then
+      for _, entry in ipairs(TEST_VOTERS) do
+        if self.testVotes[entry.name] == "GREED" then
+          winner = entry.name
+          break
+        end
+      end
+    elseif counts.TRANSMOG > 0 then
+      for _, entry in ipairs(TEST_VOTERS) do
+        if self.testVotes[entry.name] == "TRANSMOG" then
+          winner = entry.name
+          break
+        end
+      end
+    end
+    winnerLabel:SetText("Winner: " .. (winner or "None"))
+  end
+  self.resultsScroll:AddChild(winnerLabel)
+
+  for _, entry in ipairs(TEST_VOTERS) do
+    local row = AceGUI:Create("Label")
+    row:SetFullWidth(true)
+    row:SetText(string.format("%s -> %s", entry.name, self.testVotes[entry.name] or "-"))
+    self.resultsScroll:AddChild(row)
+  end
 end
 
 function TestUI:RefreshInstanceList()
@@ -681,6 +889,10 @@ function TestUI:LoadEncounterLoot()
 end
 
 function TestUI:SimulateLootRoll(itemLink)
+  if (self.currentVoterIndex or 0) > (#TEST_VOTERS - 1) then
+    GLD:Print("All test voters completed. Use Reset Votes to start again.")
+    return
+  end
   if not itemLink or itemLink == "" then
     GLD:Print("Please enter an item link")
     return
@@ -724,8 +936,24 @@ function TestUI:SimulateLootRoll(itemLink)
   GLD.activeRolls[rollID] = session
 
   if GLD.UI then
+    local voter = GetTestVoterName((self.currentVoterIndex or 0) + 1) or "Test Player"
+    session.testVoterName = voter
     GLD.UI:ShowRollPopup(session)
   end
 
   GLD:Print("Simulated loot roll: " .. displayLink)
+end
+
+function TestUI:AdvanceTestVoter()
+  self.currentVoterIndex = (self.currentVoterIndex or 0) + 1
+  if self.currentVoterIndex > (#TEST_VOTERS - 1) then
+    self.currentVoterIndex = #TEST_VOTERS
+  end
+  self:RefreshVotePanel()
+  self:RefreshResultsPanel()
+  if self.currentVoterIndex <= (#TEST_VOTERS - 1) then
+    if self.itemLinkInput then
+      self:SimulateLootRoll(self.itemLinkInput:GetText())
+    end
+  end
 end
