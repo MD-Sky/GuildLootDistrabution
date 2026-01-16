@@ -1090,6 +1090,7 @@ function TestUI:SimulateLootRoll(itemLink)
     canGreed = true,
     canTransmog = true,
     votes = {},
+    isTest = true,
   }
 
   GLD.activeRolls[rollID] = session
@@ -1098,6 +1099,21 @@ function TestUI:SimulateLootRoll(itemLink)
     local voter = GetTestVoterName((self.currentVoterIndex or 0) + 1) or "Test Player"
     session.testVoterName = voter
     GLD.UI:ShowRollPopup(session)
+  end
+
+  if IsInRaid() or IsInGroup() then
+    local channel = IsInRaid() and "RAID" or "PARTY"
+    GLD:SendCommMessageSafe(NS.MSG.ROLL_SESSION, {
+      rollID = rollID,
+      rollTime = rollTime * 1000,
+      itemLink = displayLink,
+      itemName = displayName,
+      quality = session.quality,
+      canNeed = canNeed,
+      canGreed = true,
+      canTransmog = true,
+      test = true,
+    }, channel)
   end
 
   GLD:Print("Simulated loot roll: " .. displayLink)

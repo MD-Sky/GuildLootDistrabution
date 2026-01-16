@@ -229,9 +229,15 @@ function GLD:BroadcastSnapshot()
 end
 
 function GLD:HandleRollSession(sender, payload)
-  if not self:IsAuthority() or not payload or not payload.rollID then
+  if not payload or not payload.rollID then
     return
   end
+
+  local isTest = payload.test == true
+  if not isTest and not self:IsAuthority() then
+    return
+  end
+
   local rollID = payload.rollID
   local session = self.activeRolls and self.activeRolls[rollID] or nil
   if not session then
@@ -247,15 +253,24 @@ function GLD:HandleRollSession(sender, payload)
       votes = {},
       expectedVoters = self:BuildExpectedVoters(),
       createdAt = GetServerTime(),
+      isTest = isTest,
     }
     self.activeRolls = self.activeRolls or {}
     self.activeRolls[rollID] = session
-    C_Timer.After(payload.rollTime or 120, function()
-      local active = self.activeRolls and self.activeRolls[rollID]
-      if active and not active.locked then
-        self:FinalizeRoll(active)
-      end
-    end)
+
+    if not isTest then
+      local delay = (tonumber(payload.rollTime) or 120000) / 1000
+      C_Timer.After(delay, function()
+        local active = self.activeRolls and self.activeRolls[rollID]
+        if active and not active.locked then
+          self:FinalizeRoll(active)
+        end
+      end)
+    end
+  end
+
+  if isTest and self.UI then
+    self.UI:ShowRollPopup(session)
   end
 end
 

@@ -64,6 +64,7 @@ function GLD:OnEnable()
   self:RegisterEvent("PLAYER_ENTERING_WORLD", "OnGroupRosterUpdate")
   self:RegisterEvent("PLAYER_ROLES_ASSIGNED", "OnGroupRosterUpdate")
   self:RegisterEvent("PLAYER_GUILD_UPDATE", "OnGroupRosterUpdate")
+  self:Print("Commands: /gld (main UI), /disadmin (admin), /gldtest (seed test), /gldadmintest (admin test panel)")
 end
 
 function GLD:RegisterSlashCommands()

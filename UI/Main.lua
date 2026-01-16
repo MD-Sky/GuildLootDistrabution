@@ -18,6 +18,9 @@ end
 function UI:ToggleMain()
   if not self.mainFrame then
     self:CreateMainFrame()
+    self.mainFrame:Show()
+    self:RefreshMain()
+    return
   end
   if self.mainFrame:IsShown() then
     self.mainFrame:Hide()
