@@ -35,11 +35,47 @@ function UI:CreateMainFrame()
   frame:SetHeight(500)
   frame:SetLayout("Flow")
   frame:EnableResize(false)
+  if frame.frame and frame.frame.SetBackdrop then
+    frame.frame:SetBackdrop({
+      bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background-Dark",
+      edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+      tile = true,
+      tileSize = 32,
+      edgeSize = 32,
+      insets = { left = 11, right = 12, top = 12, bottom = 11 },
+    })
+    frame.frame:SetBackdropColor(0.05, 0.05, 0.05, 0.95)
+  end
 
   local header = AceGUI:Create("Label")
   header:SetFullWidth(true)
   header:SetText("My Position: --")
   frame:AddChild(header)
+
+  local filterGroup = AceGUI:Create("SimpleGroup")
+  filterGroup:SetFullWidth(true)
+  filterGroup:SetLayout("Flow")
+
+  local showAbsent = AceGUI:Create("CheckBox")
+  showAbsent:SetLabel("Show Offline Members")
+  showAbsent:SetValue(true)
+  showAbsent:SetWidth(180)
+  showAbsent:SetCallback("OnValueChanged", function(_, _, value)
+    UI.showAbsent = value
+    UI:RefreshMain()
+  end)
+  filterGroup:AddChild(showAbsent)
+
+  local search = AceGUI:Create("EditBox")
+  search:SetLabel("Player Search")
+  search:SetWidth(220)
+  search:SetCallback("OnTextChanged", function(_, _, value)
+    UI.filterText = value
+    UI:RefreshMain()
+  end)
+  filterGroup:AddChild(search)
+
+  frame:AddChild(filterGroup)
 
   local adminButton = AceGUI:Create("Button")
   adminButton:SetText("Admin Panel")
@@ -83,6 +119,17 @@ function UI:CreateMainFrame()
   rosterGroup:SetFullWidth(true)
   rosterGroup:SetFullHeight(true)
   rosterGroup:SetLayout("Fill")
+  if rosterGroup.frame and rosterGroup.frame.SetBackdrop then
+    rosterGroup.frame:SetBackdrop({
+      bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
+      edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+      tile = true,
+      tileSize = 8,
+      edgeSize = 10,
+      insets = { left = 2, right = 2, top = 2, bottom = 2 },
+    })
+    rosterGroup.frame:SetBackdropColor(0.08, 0.08, 0.08, 0.9)
+  end
 
   local scroll = AceGUI:Create("ScrollFrame")
   scroll:SetLayout("Flow")
@@ -92,6 +139,8 @@ function UI:CreateMainFrame()
 
   self.mainFrame = frame
   self.header = header
+  self.showAbsent = true
+  self.filterText = ""
   self.scroll = scroll
 end
 
@@ -118,21 +167,27 @@ function UI:RefreshMain()
 
   self.scroll:ReleaseChildren()
 
-  local rows = self:GetRosterRows(isAdmin)
-  for _, row in ipairs(rows) do
-    local label = AceGUI:Create("Label")
-    label:SetFullWidth(true)
-    label:SetText(row)
-    self.scroll:AddChild(label)
+  local entries = self:GetRosterEntries(isAdmin)
+  self:AddHeaderRow(isAdmin)
+  self:AddDivider()
+  for _, entry in ipairs(entries) do
+    self:AddRosterRow(entry, isAdmin)
+    self:AddDivider()
   end
 end
 
-function UI:GetRosterRows(isAdmin)
-  local rows = {}
+function UI:GetRosterEntries(isAdmin)
+  local entries = {}
+  local filter = (self.filterText or ""):lower()
+
   if isAdmin then
     local list = {}
     for _, player in pairs(GLD.db.players) do
-      table.insert(list, player)
+      if self.showAbsent or player.attendance == "PRESENT" then
+        if filter == "" or (player.name and player.name:lower():find(filter, 1, true)) then
+          table.insert(list, player)
+        end
+      end
     end
 
     table.sort(list, function(a, b)
@@ -152,27 +207,26 @@ function UI:GetRosterRows(isAdmin)
     end)
 
     for _, player in ipairs(list) do
-      local role = NS:GetRoleForPlayer(player.name)
-      local classIcon = NS:GetClassIcon(player.class)
-      local roleIcon = NS:GetRoleIcon(role)
-      local attendance = NS:ColorAttendance(player.attendance)
-      local row = string.format("%s %s %s | Pos: %s | Prev: %s | Won: %s | Raids: %s | %s",
-        classIcon,
-        roleIcon,
-        player.name or "?",
-        player.queuePos or "-",
-        player.savedPos or "-",
-        player.numAccepted or 0,
-        player.attendanceCount or 0,
-        attendance
-      )
-      table.insert(rows, row)
+      table.insert(entries, {
+        name = player.name,
+        class = player.class,
+        role = NS:GetRoleForPlayer(player.name),
+        queuePos = player.queuePos,
+        savedPos = player.savedPos,
+        attendance = player.attendance,
+        numAccepted = player.numAccepted,
+        attendanceCount = player.attendanceCount,
+      })
     end
   else
     local roster = GLD.shadow and GLD.shadow.roster or {}
     local list = {}
     for _, entry in pairs(roster) do
-      table.insert(list, entry)
+      if self.showAbsent or entry.attendance == "PRESENT" then
+        if filter == "" or (entry.name and entry.name:lower():find(filter, 1, true)) then
+          table.insert(list, entry)
+        end
+      end
     end
     table.sort(list, function(a, b)
       if a.queuePos and b.queuePos then
@@ -182,26 +236,124 @@ function UI:GetRosterRows(isAdmin)
     end)
 
     for _, entry in ipairs(list) do
-      local role = entry.role or "NONE"
-      local classIcon = NS:GetClassIcon(entry.class)
-      local roleIcon = NS:GetRoleIcon(role)
-      local attendance = NS:ColorAttendance(entry.attendance)
-      local row = string.format("%s %s %s | Pos: %s | %s",
-        classIcon,
-        roleIcon,
-        entry.name or "?",
-        entry.queuePos or "-",
-        attendance
-      )
-      table.insert(rows, row)
+      table.insert(entries, {
+        name = entry.name,
+        class = entry.class,
+        role = entry.role or "NONE",
+        queuePos = entry.queuePos,
+        attendance = entry.attendance,
+      })
     end
   end
 
-  if #rows == 0 then
-    table.insert(rows, "No roster data")
+  return entries
+end
+
+function UI:AddHeaderRow(isAdmin)
+  local row = AceGUI:Create("SimpleGroup")
+  row:SetFullWidth(true)
+  row:SetLayout("Flow")
+
+  local classHeader = AceGUI:Create("Label")
+  classHeader:SetText("Class")
+  classHeader:SetWidth(60)
+  row:AddChild(classHeader)
+
+  local roleHeader = AceGUI:Create("Label")
+  roleHeader:SetText("Role")
+  roleHeader:SetWidth(50)
+  row:AddChild(roleHeader)
+
+  local nameHeader = AceGUI:Create("Label")
+  nameHeader:SetText("Name")
+  nameHeader:SetWidth(180)
+  row:AddChild(nameHeader)
+
+  local posHeader = AceGUI:Create("Label")
+  posHeader:SetText("Queue")
+  posHeader:SetWidth(60)
+  row:AddChild(posHeader)
+
+  if isAdmin then
+    local prevHeader = AceGUI:Create("Label")
+    prevHeader:SetText("Prev")
+    prevHeader:SetWidth(50)
+    row:AddChild(prevHeader)
+
+    local wonHeader = AceGUI:Create("Label")
+    wonHeader:SetText("Won")
+    wonHeader:SetWidth(50)
+    row:AddChild(wonHeader)
+
+    local raidsHeader = AceGUI:Create("Label")
+    raidsHeader:SetText("Raids")
+    raidsHeader:SetWidth(60)
+    row:AddChild(raidsHeader)
   end
 
-  return rows
+  local attendanceHeader = AceGUI:Create("Label")
+  attendanceHeader:SetText("Attendance")
+  attendanceHeader:SetWidth(90)
+  row:AddChild(attendanceHeader)
+
+  self.scroll:AddChild(row)
+end
+
+function UI:AddDivider()
+  local divider = AceGUI:Create("Heading")
+  divider:SetText(" ")
+  divider:SetFullWidth(true)
+  self.scroll:AddChild(divider)
+end
+
+function UI:AddRosterRow(entry, isAdmin)
+  local row = AceGUI:Create("SimpleGroup")
+  row:SetFullWidth(true)
+  row:SetLayout("Flow")
+
+  local classLabel = AceGUI:Create("Label")
+  classLabel:SetText(NS:GetClassIcon(entry.class))
+  classLabel:SetWidth(60)
+  row:AddChild(classLabel)
+
+  local roleLabel = AceGUI:Create("Label")
+  roleLabel:SetText(NS:GetRoleIcon(entry.role))
+  roleLabel:SetWidth(50)
+  row:AddChild(roleLabel)
+
+  local nameLabel = AceGUI:Create("Label")
+  nameLabel:SetText(entry.name or "?")
+  nameLabel:SetWidth(180)
+  row:AddChild(nameLabel)
+
+  local posLabel = AceGUI:Create("Label")
+  posLabel:SetText(entry.queuePos or "-")
+  posLabel:SetWidth(60)
+  row:AddChild(posLabel)
+
+  if isAdmin then
+    local prevLabel = AceGUI:Create("Label")
+    prevLabel:SetText(entry.savedPos or "-")
+    prevLabel:SetWidth(50)
+    row:AddChild(prevLabel)
+
+    local wonLabel = AceGUI:Create("Label")
+    wonLabel:SetText(entry.numAccepted or 0)
+    wonLabel:SetWidth(50)
+    row:AddChild(wonLabel)
+
+    local raidsLabel = AceGUI:Create("Label")
+    raidsLabel:SetText(entry.attendanceCount or 0)
+    raidsLabel:SetWidth(60)
+    row:AddChild(raidsLabel)
+  end
+
+  local attendanceLabel = AceGUI:Create("Label")
+  attendanceLabel:SetText(NS:ColorAttendance(entry.attendance))
+  attendanceLabel:SetWidth(90)
+  row:AddChild(attendanceLabel)
+
+  self.scroll:AddChild(row)
 end
 
 function UI:ShowRollPopup(session)
