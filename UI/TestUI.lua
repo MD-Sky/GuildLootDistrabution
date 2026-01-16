@@ -312,6 +312,12 @@ local function EJ_Call(name, ...)
   return nil
 end
 
+function TestUI:SetEJStatus(text)
+  if self.ejStatusLabel then
+    self.ejStatusLabel:SetText(text or "")
+  end
+end
+
 function GLD:InitTestUI()
   TestUI.testFrame = nil
   TestUI.testVotes = {}
@@ -497,6 +503,20 @@ function TestUI:CreateTestFrame()
   encounterSelect:SetWidth(260)
   lootFrame:AddChild(encounterSelect)
 
+  local ejStatusLabel = AceGUI:Create("Label")
+  ejStatusLabel:SetFullWidth(true)
+  ejStatusLabel:SetText("Encounter Journal: idle")
+  lootFrame:AddChild(ejStatusLabel)
+
+  local ejReloadBtn = AceGUI:Create("Button")
+  ejReloadBtn:SetText("Reload Encounter Journal")
+  ejReloadBtn:SetWidth(200)
+  ejReloadBtn:SetCallback("OnClick", function()
+    TestUI:SetEJStatus("Encounter Journal: reloading...")
+    TestUI:RefreshInstanceList()
+  end)
+  lootFrame:AddChild(ejReloadBtn)
+
   local loadLootBtn = AceGUI:Create("Button")
   loadLootBtn:SetText("Load Loot")
   loadLootBtn:SetWidth(120)
@@ -553,6 +573,7 @@ function TestUI:CreateTestFrame()
   self.lootScroll = lootScroll
   self.instanceSelect = instanceSelect
   self.lootFrame = lootFrame
+  self.ejStatusLabel = ejStatusLabel
 
   self.encounterSelect = encounterSelect
   self.itemLinkInput = itemLinkInput
@@ -957,6 +978,11 @@ function TestUI:RefreshInstanceList()
     return
   end
 
+  if InCombatLockdown and InCombatLockdown() then
+    self:SetEJStatus("Encounter Journal: unavailable in combat")
+    return
+  end
+
   if not EncounterJournal then
     if C_AddOns and C_AddOns.LoadAddOn then
       C_AddOns.LoadAddOn("Blizzard_EncounterJournal")
@@ -969,6 +995,7 @@ function TestUI:RefreshInstanceList()
   end
 
   if not EncounterJournal or (not (C_EncounterJournal and C_EncounterJournal.GetNumTiers) and not _G.EJ_GetNumTiers) then
+    self:SetEJStatus("Encounter Journal: loading...")
     if not self._ejDebugShown then
       self._ejDebugShown = true
       GLD:Debug("EJ not ready yet (EncounterJournal or EJ_GetNumTiers missing)")
@@ -986,6 +1013,7 @@ function TestUI:RefreshInstanceList()
 
   local tiers = EJ_Call("GetNumTiers") or 0
   if tiers == 0 then
+    self:SetEJStatus("Encounter Journal: no tiers yet")
     if not self._ejDebugShown then
       self._ejDebugShown = true
       GLD:Debug("EJ tiers = 0 (no data yet)")
@@ -1011,6 +1039,7 @@ function TestUI:RefreshInstanceList()
 
   self.instanceSelect:SetList(values, order)
   if #order == 0 then
+    self:SetEJStatus("Encounter Journal: no raids returned")
     if not self._ejDebugShown then
       self._ejDebugShown = true
       GLD:Debug("EJ instances = 0 (no raids returned)")
@@ -1020,6 +1049,8 @@ function TestUI:RefreshInstanceList()
     end)
     return
   end
+
+  self:SetEJStatus("Encounter Journal: ready")
 
   if not self.selectedInstance and order[1] then
     self.instanceSelect:SetValue(order[1])
@@ -1031,6 +1062,10 @@ function TestUI:SelectInstance(instanceID)
   if not instanceID then
     return
   end
+  if InCombatLockdown and InCombatLockdown() then
+    self:SetEJStatus("Encounter Journal: unavailable in combat")
+    return
+  end
   if not EncounterJournal then
     if C_AddOns and C_AddOns.LoadAddOn then
       C_AddOns.LoadAddOn("Blizzard_EncounterJournal")
@@ -1039,6 +1074,7 @@ function TestUI:SelectInstance(instanceID)
     end
   end
   if not (C_EncounterJournal and C_EncounterJournal.SelectInstance) and not _G.EJ_SelectInstance then
+    self:SetEJStatus("Encounter Journal: not ready")
     return
   end
   self.selectedInstance = instanceID
@@ -1083,6 +1119,7 @@ function TestUI:SelectInstance(instanceID)
 
   self.encounterSelect:SetList(encounters, order)
   if #order == 0 then
+    self:SetEJStatus("Encounter Journal: no encounters for raid")
     GLD:Debug("EJ encounters = 0 for instance " .. tostring(instanceID))
   end
   if order[1] then
@@ -1113,6 +1150,11 @@ function TestUI:LoadEncounterLoot(retryCount)
     return
   end
 
+  if InCombatLockdown and InCombatLockdown() then
+    self:SetEJStatus("Encounter Journal: unavailable in combat")
+    return
+  end
+
   local encounterIndex = self.selectedEncounterIndex
   if type(encounterIndex) ~= "number" then
     GLD:Debug("LoadLoot: invalid encounterIndex " .. tostring(self.selectedEncounterIndex))
@@ -1132,6 +1174,7 @@ function TestUI:LoadEncounterLoot(retryCount)
     end
   end
   if not (C_EncounterJournal and C_EncounterJournal.GetLootInfoByIndex) and not _G.EJ_GetLootInfoByIndex then
+    self:SetEJStatus("Encounter Journal: loot data unavailable")
     GLD:Debug("LoadLoot: EJ_GetLootInfoByIndex missing")
     return
   end
@@ -1334,6 +1377,9 @@ function TestUI:SimulateLootRoll(itemLink)
     end
     session.testVoterName = voter
     GLD.UI:ShowRollPopup(session)
+    if GLD.UI.ShowPendingFrame then
+      GLD.UI:ShowPendingFrame()
+    end
   end
 
   if IsInRaid() or IsInGroup() then

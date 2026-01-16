@@ -234,9 +234,6 @@ function GLD:HandleRollSession(sender, payload)
   end
 
   local isTest = payload.test == true
-  if not isTest and not self:IsAuthority() then
-    return
-  end
 
   local rollID = payload.rollID
   local session = self.activeRolls and self.activeRolls[rollID] or nil
@@ -280,8 +277,8 @@ function GLD:HandleRollSession(sender, payload)
     self.UI:ShowRollPopup(session)
   end
 
-  if self.UI and self.UI.RefreshPendingVotes then
-    self.UI:RefreshPendingVotes()
+  if self.UI and self.UI.ShowPendingFrame then
+    self.UI:ShowPendingFrame()
   end
 end
 

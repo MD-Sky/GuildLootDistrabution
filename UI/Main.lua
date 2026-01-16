@@ -181,6 +181,16 @@ function UI:CreatePendingFrame()
   self.pendingScroll = pendingScroll
 end
 
+function UI:ShowPendingFrame()
+  if not self.pendingFrame then
+    self:CreatePendingFrame()
+  end
+  if not self.pendingFrame:IsShown() then
+    self.pendingFrame:Show()
+  end
+  self:RefreshPendingVotes()
+end
+
 function UI:TogglePendingFrame()
   if not self.pendingFrame then
     self:CreatePendingFrame()
@@ -235,6 +245,57 @@ function UI:RefreshPendingVotes()
 
   self.pendingScroll:ReleaseChildren()
 
+  local guidToInfo = {}
+  local nameToInfo = {}
+  local nameRealmToInfo = {}
+
+  local function addName(name, realm, classFile)
+    if not name or name == "" then
+      return
+    end
+    local full = realm and realm ~= "" and (name .. "-" .. realm) or name
+    nameToInfo[name] = { name = name, class = classFile }
+    nameRealmToInfo[full] = { name = name, class = classFile }
+  end
+
+  local function addUnit(unit)
+    if not UnitExists(unit) then
+      return
+    end
+    local name, realm = UnitName(unit)
+    if not name then
+      return
+    end
+    local classFile = select(2, UnitClass(unit))
+    local guid = UnitGUID(unit)
+    if guid then
+      guidToInfo[guid] = { name = name, class = classFile }
+    end
+    addName(name, realm, classFile)
+  end
+
+  if IsInRaid() then
+    for i = 1, GetNumGroupMembers() do
+      addUnit("raid" .. i)
+    end
+  elseif IsInGroup() then
+    for i = 1, GetNumSubgroupMembers() do
+      addUnit("party" .. i)
+    end
+    addUnit("player")
+  else
+    addUnit("player")
+  end
+
+  for key, player in pairs(GLD.db.players or {}) do
+    if player and player.name then
+      addName(player.name, player.realm, player.class)
+      if key and key:find("^Player%-") then
+        guidToInfo[key] = { name = player.name, class = player.class }
+      end
+    end
+  end
+
   local rolls = {}
   for rollID, session in pairs(GLD.activeRolls or {}) do
     if session and not session.locked then
@@ -257,11 +318,19 @@ function UI:RefreshPendingVotes()
     if not key then
       return "?", nil
     end
-    local player = GLD.db and GLD.db.players and GLD.db.players[key]
-    if player and player.name then
-      return player.name, player.class
+    local guidMatch = guidToInfo[key]
+    if guidMatch then
+      return guidMatch.name, guidMatch.class
+    end
+    local nameMatch = nameRealmToInfo[key]
+    if nameMatch then
+      return nameMatch.name, nameMatch.class
     end
     local name = NS:GetNameRealmFromKey(key)
+    if name and nameToInfo[name] then
+      local info = nameToInfo[name]
+      return info.name, info.class
+    end
     if name then
       return name, nil
     end
@@ -534,6 +603,10 @@ end
 function UI:ShowRollPopup(session)
   if not AceGUI then
     return
+  end
+
+  if self.ShowPendingFrame then
+    self:ShowPendingFrame()
   end
 
   if self.rollFrame then

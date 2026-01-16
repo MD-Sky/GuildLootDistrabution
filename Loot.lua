@@ -245,8 +245,8 @@ function GLD:OnStartLootRoll(rollID, rollTime, lootHandle)
 
   if self.UI then
     self.UI:ShowRollPopup(session)
-    if self.UI.RefreshPendingVotes then
-      self.UI:RefreshPendingVotes()
+    if self.UI.ShowPendingFrame then
+      self.UI:ShowPendingFrame()
     end
   end
 
