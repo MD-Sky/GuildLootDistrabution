@@ -13,6 +13,7 @@ function GLD:InitUI()
   end
   UI.mainFrame = nil
   UI.rollFrame = nil
+  UI.rollFrames = nil
 end
 
 function UI:ToggleMain()
@@ -37,7 +38,15 @@ function UI:CreateMainFrame()
   frame:SetWidth(800)
   frame:SetHeight(500)
   frame:SetLayout("Flow")
-  frame:EnableResize(false)
+  frame:EnableResize(true)
+  if frame.frame then
+    frame.frame:HookScript("OnSizeChanged", function()
+      if UI.guestAnchorsVisible == false and UI.guestGroup and UI.guestGroup.frame then
+        UI.guestGroup.frame:Hide()
+        UI.guestGroup:SetHeight(1)
+      end
+    end)
+  end
   if frame.frame and frame.frame.SetBackdrop then
     frame.frame:SetBackdrop({
       bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background-Dark",
@@ -104,6 +113,19 @@ function UI:CreateMainFrame()
   end)
   frame:AddChild(refreshGuildBtn)
 
+  local toggleGuestsBtn = AceGUI:Create("Button")
+  toggleGuestsBtn:SetText("Toggle Guest Anchors")
+  toggleGuestsBtn:SetWidth(160)
+  toggleGuestsBtn:SetCallback("OnClick", function()
+    if GLD:IsAdmin() then
+      UI.guestAnchorsVisible = not UI.guestAnchorsVisible
+      UI:RefreshMain()
+    else
+      GLD:Print("you do not have Guild Permission to access this panel")
+    end
+  end)
+  frame:AddChild(toggleGuestsBtn)
+
   local sessionStart = AceGUI:Create("Button")
   sessionStart:SetText("Start Session")
   sessionStart:SetWidth(120)
@@ -135,6 +157,14 @@ function UI:CreateMainFrame()
   guestGroup:SetFullWidth(true)
   guestGroup:SetHeight(80)
   guestGroup:SetLayout("Fill")
+  if guestGroup.frame then
+    guestGroup.frame:HookScript("OnShow", function()
+      if UI.guestAnchorsVisible == false then
+        guestGroup.frame:Hide()
+        guestGroup:SetHeight(1)
+      end
+    end)
+  end
 
   local guestScroll = AceGUI:Create("ScrollFrame")
   guestScroll:SetLayout("Flow")
@@ -142,17 +172,18 @@ function UI:CreateMainFrame()
 
   frame:AddChild(guestGroup)
 
-  local guestSpacer = AceGUI:Create("SimpleGroup")
-  guestSpacer:SetFullWidth(true)
-  guestSpacer:SetHeight(15)
-  frame:AddChild(guestSpacer)
+  local rosterDescription = AceGUI:Create("Label")
+  rosterDescription:SetFullWidth(true)
+  rosterDescription:SetHeight(24)
+  rosterDescription:SetText("This table shows all guild members in the current session, including their role, loot history, raid participation, and attendance status to support fair loot decisions.")
+  frame:AddChild(rosterDescription)
 
-  local rosterGroup = AceGUI:Create("SimpleGroup")
-  rosterGroup:SetFullWidth(true)
-  rosterGroup:SetFullHeight(true)
-  rosterGroup:SetLayout("Fill")
-  if rosterGroup.frame and rosterGroup.frame.SetBackdrop then
-    rosterGroup.frame:SetBackdrop({
+  local rosterContainer = AceGUI:Create("SimpleGroup")
+  rosterContainer:SetFullWidth(true)
+  rosterContainer:SetFullHeight(true)
+  rosterContainer:SetLayout("List")
+  if rosterContainer.frame and rosterContainer.frame.SetBackdrop then
+    rosterContainer.frame:SetBackdrop({
       bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
       edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
       tile = true,
@@ -160,14 +191,21 @@ function UI:CreateMainFrame()
       edgeSize = 10,
       insets = { left = 2, right = 2, top = 2, bottom = 2 },
     })
-    rosterGroup.frame:SetBackdropColor(0.08, 0.08, 0.08, 0.9)
+    rosterContainer.frame:SetBackdropColor(0.08, 0.08, 0.08, 0.9)
   end
+
+  local rosterHeaderGroup = AceGUI:Create("SimpleGroup")
+  rosterHeaderGroup:SetFullWidth(true)
+  rosterHeaderGroup:SetLayout("Flow")
+  rosterContainer:AddChild(rosterHeaderGroup)
 
   local scroll = AceGUI:Create("ScrollFrame")
   scroll:SetLayout("Flow")
-  rosterGroup:AddChild(scroll)
+  scroll:SetFullWidth(true)
+  scroll:SetFullHeight(true)
+  rosterContainer:AddChild(scroll)
 
-  frame:AddChild(rosterGroup)
+  frame:AddChild(rosterContainer)
 
   self.mainFrame = frame
   self.header = header
@@ -176,6 +214,9 @@ function UI:CreateMainFrame()
   self.scroll = scroll
   self.guestGroup = guestGroup
   self.guestScroll = guestScroll
+  self.rosterHeader = rosterHeaderGroup
+  self.toggleGuestsBtn = toggleGuestsBtn
+  self.guestAnchorsVisible = true
 end
 
 function UI:CreatePendingFrame()
@@ -260,13 +301,41 @@ function UI:RefreshMain()
 
   GLD:UpdateGuestAttendanceFromGroup()
 
-  self:RefreshGuestAnchors(isAdmin)
+  if self.toggleGuestsBtn and self.toggleGuestsBtn.frame then
+    if isAdmin then
+      self.toggleGuestsBtn.frame:Show()
+    else
+      self.toggleGuestsBtn.frame:Hide()
+    end
+  end
 
+  if self.guestAnchorsVisible ~= false then
+    if self.guestGroup and self.guestGroup.frame then
+      self.guestGroup.frame:Show()
+      self.guestGroup:SetHeight(80)
+    end
+    self:RefreshGuestAnchors(isAdmin)
+  else
+    if self.guestGroup and self.guestGroup.frame then
+      self.guestGroup.frame:Hide()
+      self.guestGroup:SetHeight(1)
+    end
+    if self.guestScroll then
+      self.guestScroll:ReleaseChildren()
+    end
+  end
+
+  if self.mainFrame and self.mainFrame.DoLayout then
+    self.mainFrame:DoLayout()
+  end
+
+  if self.rosterHeader then
+    self.rosterHeader:ReleaseChildren()
+  end
   self.scroll:ReleaseChildren()
 
   local entries = self:GetRosterEntries(isAdmin)
-  self:AddHeaderRow(isAdmin)
-  self:AddDivider()
+  self:AddHeaderRow(isAdmin, self.rosterHeader)
   for _, entry in ipairs(entries) do
     self:AddRosterRow(entry, isAdmin)
     self:AddDivider()
@@ -319,9 +388,10 @@ function UI:RefreshGuestAnchors(isAdmin)
     local empty = AceGUI:Create("Label")
     empty:SetText("No non-guild party/raid members found.")
     empty:SetFullWidth(true)
+    empty:SetHeight(18)
     self.guestScroll:AddChild(empty)
     if self.guestGroup then
-      self.guestGroup:SetHeight(60)
+      self.guestGroup:SetHeight(70)
     end
     return
   end
@@ -368,8 +438,8 @@ function UI:RefreshGuestAnchors(isAdmin)
   end
 
   if self.guestGroup then
-    local rowHeight = 26
-    local padding = 24
+    local rowHeight = 28
+    local padding = 18
     self.guestGroup:SetHeight((#units * rowHeight) + padding)
   end
 end
@@ -551,7 +621,17 @@ function UI:RefreshPendingVotes()
     local waitingLabel = AceGUI:Create("Label")
     waitingLabel:SetWidth(140)
     if #pending == 0 then
-      waitingLabel:SetText("|cffaaaaaaWaiting: none|r")
+      local winnerKey = GLD.ResolveRollWinner and GLD:ResolveRollWinner(session) or nil
+      local winnerName = nil
+      if winnerKey then
+        local name, _, full = getNameAndClass(winnerKey)
+        winnerName = full or name
+      end
+      if winnerName and winnerName ~= "" then
+        waitingLabel:SetText("|cff88ff88Winner: " .. winnerName .. "|r")
+      else
+        waitingLabel:SetText("|cffaaaaaaWaiting: none|r")
+      end
     else
       waitingLabel:SetText("|cffaaaaaaWaiting: " .. table.concat(pending, ", ") .. "|r")
     end
@@ -658,7 +738,8 @@ function UI:GetRosterEntries(isAdmin)
   return entries
 end
 
-function UI:AddHeaderRow(isAdmin)
+function UI:AddHeaderRow(isAdmin, container)
+  local target = container or self.scroll
   local row = AceGUI:Create("SimpleGroup")
   row:SetFullWidth(true)
   row:SetLayout("Flow")
@@ -705,7 +786,7 @@ function UI:AddHeaderRow(isAdmin)
   attendanceHeader:SetWidth(90)
   row:AddChild(attendanceHeader)
 
-  self.scroll:AddChild(row)
+  target:AddChild(row)
 end
 
 function UI:AddDivider()
@@ -780,8 +861,10 @@ function UI:ShowRollPopup(session)
     self:ShowPendingFrame()
   end
 
-  if self.rollFrame then
-    self.rollFrame:Release()
+  self.rollFrames = self.rollFrames or {}
+  if session.rollID and self.rollFrames[session.rollID] then
+    self.rollFrames[session.rollID]:Release()
+    self.rollFrames[session.rollID] = nil
   end
 
   local frame = AceGUI:Create("Frame")
@@ -806,6 +889,13 @@ function UI:ShowRollPopup(session)
     })
     frame.frame:SetBackdropColor(0, 0, 0, 1)
   end
+
+  frame:SetCallback("OnClose", function(widget)
+    if session.rollID and self.rollFrames then
+      self.rollFrames[session.rollID] = nil
+    end
+    widget:Release()
+  end)
 
   local icon = "Interface\\Icons\\INV_Misc_QuestionMark"
   if session.itemLink then
@@ -925,7 +1015,10 @@ function UI:ShowRollPopup(session)
         end
         return
       end
-      frame:Hide()
+      if session.rollID and self.rollFrames then
+        self.rollFrames[session.rollID] = nil
+      end
+      frame:Release()
       if NS.TestUI and session.testVoterName and not IsInGroup() and not IsInRaid() then
         NS.TestUI.testVotes[session.testVoterName] = btn.vote
         NS.TestUI:AdvanceTestVoter()
@@ -934,7 +1027,11 @@ function UI:ShowRollPopup(session)
     frame:AddChild(button)
   end
 
-  self.rollFrame = frame
+  if session.rollID then
+    self.rollFrames[session.rollID] = frame
+  else
+    self.rollFrame = frame
+  end
 end
 
 function UI:ShowRollResultPopup(result)

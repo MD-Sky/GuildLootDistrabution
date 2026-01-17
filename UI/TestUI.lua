@@ -345,6 +345,29 @@ function TestUI:ResetTestVotes()
   self.currentVoterIndex = 0
 end
 
+function TestUI:ResetSoloTestVotes()
+  self:ResetTestVotes()
+  self.currentTestRollID = nil
+  self._lastTestResultKey = nil
+  if GLD.activeRolls then
+    for _, session in pairs(GLD.activeRolls) do
+      if session and session.isTest then
+        session.votes = {}
+        session.locked = nil
+      end
+    end
+  end
+  if self.RefreshVotePanel then
+    self:RefreshVotePanel()
+  end
+  if self.RefreshResultsPanel then
+    self:RefreshResultsPanel()
+  end
+  if GLD.UI and GLD.UI.RefreshPendingVotes then
+    GLD.UI:RefreshPendingVotes()
+  end
+end
+
 function TestUI:UpdateDynamicTestVoters()
   local voters = BuildDynamicTestVoters()
   if not voters then
@@ -371,19 +394,34 @@ function TestUI:UpdateDynamicTestVoters()
 end
 
 function TestUI:SetSelectedItemLink(itemLink)
-  if self.itemLinkInput and itemLink then
-    self.itemLinkInput:SetText(itemLink)
+  if not itemLink then
+    return
+  end
+  local primary = self.itemLinkInput
+  local secondary = self.itemLinkInput2
+  local primaryText = primary and primary:GetText() or ""
+  local secondaryText = secondary and secondary:GetText() or ""
+  if primary and primaryText == "" then
+    primary:SetText(itemLink)
+  elseif secondary and secondaryText == "" then
+    secondary:SetText(itemLink)
+  elseif primary then
+    primary:SetText(itemLink)
   end
   self:UpdateSelectedItemInfo()
 end
 
 function TestUI:UpdateSelectedItemInfo()
-  if not self.itemArmorLabel then
-    return
+  if self.itemArmorLabel then
+    local itemLink = NormalizeItemInput(self.itemLinkInput and self.itemLinkInput:GetText() or nil)
+    local armorType = GetArmorTypeOnly(itemLink)
+    self.itemArmorLabel:SetText("Armor Type: " .. armorType)
   end
-  local itemLink = NormalizeItemInput(self.itemLinkInput and self.itemLinkInput:GetText() or nil)
-  local armorType = GetArmorTypeOnly(itemLink)
-  self.itemArmorLabel:SetText("Armor Type: " .. armorType)
+  if self.itemArmorLabel2 then
+    local itemLink2 = NormalizeItemInput(self.itemLinkInput2 and self.itemLinkInput2:GetText() or nil)
+    local armorType2 = GetArmorTypeOnly(itemLink2)
+    self.itemArmorLabel2:SetText("Armor Type 2: " .. armorType2)
+  end
 end
 
 function TestUI:ToggleTestPanel()
@@ -561,13 +599,40 @@ function TestUI:CreateTestFrame()
   itemArmorLabel:SetText("Armor Type: -")
   lootFrame:AddChild(itemArmorLabel)
 
+  local itemLinkInput2 = AceGUI:Create("EditBox")
+  itemLinkInput2:SetLabel("Item Link 2")
+  itemLinkInput2:SetWidth(260)
+  lootFrame:AddChild(itemLinkInput2)
+
+  local itemArmorLabel2 = AceGUI:Create("Label")
+  itemArmorLabel2:SetFullWidth(true)
+  itemArmorLabel2:SetText("Armor Type 2: -")
+  lootFrame:AddChild(itemArmorLabel2)
+
   local dropBtn = AceGUI:Create("Button")
-  dropBtn:SetText("Simulate Loot Roll")
+  dropBtn:SetText("Simulate Item 1")
   dropBtn:SetWidth(150)
   dropBtn:SetCallback("OnClick", function()
     TestUI:SimulateLootRoll(itemLinkInput:GetText())
   end)
   lootFrame:AddChild(dropBtn)
+
+  local dropBtn2 = AceGUI:Create("Button")
+  dropBtn2:SetText("Simulate Item 2")
+  dropBtn2:SetWidth(150)
+  dropBtn2:SetCallback("OnClick", function()
+    TestUI:SimulateLootRoll(itemLinkInput2:GetText())
+  end)
+  lootFrame:AddChild(dropBtn2)
+
+  local dropBothBtn = AceGUI:Create("Button")
+  dropBothBtn:SetText("Simulate Both")
+  dropBothBtn:SetWidth(150)
+  dropBothBtn:SetCallback("OnClick", function()
+    TestUI:SimulateLootRoll(itemLinkInput:GetText())
+    TestUI:SimulateLootRoll(itemLinkInput2:GetText())
+  end)
+  lootFrame:AddChild(dropBothBtn)
 
   local pendingBtn = AceGUI:Create("Button")
   pendingBtn:SetText("Show Pending Votes UI")
@@ -606,6 +671,8 @@ function TestUI:CreateTestFrame()
   self.encounterSelect = encounterSelect
   self.itemLinkInput = itemLinkInput
   self.itemArmorLabel = itemArmorLabel
+  self.itemLinkInput2 = itemLinkInput2
+  self.itemArmorLabel2 = itemArmorLabel2
 
   instanceSelect:SetCallback("OnValueChanged", function(_, _, value)
     TestUI:SelectInstance(value)
@@ -620,6 +687,12 @@ function TestUI:CreateTestFrame()
     TestUI:UpdateSelectedItemInfo()
   end)
   itemLinkInput:SetCallback("OnTextChanged", function()
+    TestUI:UpdateSelectedItemInfo()
+  end)
+  itemLinkInput2:SetCallback("OnEnterPressed", function()
+    TestUI:UpdateSelectedItemInfo()
+  end)
+  itemLinkInput2:SetCallback("OnTextChanged", function()
     TestUI:UpdateSelectedItemInfo()
   end)
   self:UpdateSelectedItemInfo()
@@ -886,6 +959,16 @@ function TestUI:RefreshResultsPanel()
   self:UpdateDynamicTestVoters()
 
   self.resultsScroll:ReleaseChildren()
+
+  if self.disableManualVotes and not IsInGroup() and not IsInRaid() then
+    local resetSoloBtn = AceGUI:Create("Button")
+    resetSoloBtn:SetText("Reset Solo Test Votes")
+    resetSoloBtn:SetWidth(180)
+    resetSoloBtn:SetCallback("OnClick", function()
+      self:ResetSoloTestVotes()
+    end)
+    self.resultsScroll:AddChild(resetSoloBtn)
+  end
 
   local header = AceGUI:Create("Label")
   header:SetFullWidth(true)
@@ -1489,9 +1572,13 @@ function TestUI:AdvanceTestVoter()
   end
   self:RefreshVotePanel()
   self:RefreshResultsPanel()
-  if self.currentVoterIndex <= (#activeVoters - 1) then
+  local soloLive = self.disableManualVotes and not IsInGroup() and not IsInRaid()
+  if not soloLive and self.currentVoterIndex <= (#activeVoters - 1) then
     if self.itemLinkInput then
       self:SimulateLootRoll(self.itemLinkInput:GetText())
+    end
+    if self.itemLinkInput2 then
+      self:SimulateLootRoll(self.itemLinkInput2:GetText())
     end
   end
 end
