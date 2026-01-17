@@ -34,6 +34,7 @@ function GLD:SeedTestData()
       lastWinAt = 0,
       isHonorary = false,
       attendanceCount = math.max(0, i - 3),
+      source = "test",
     }
     if data.attendance == "PRESENT" then
       table.insert(self.db.queue, key)

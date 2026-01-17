@@ -92,6 +92,18 @@ function UI:CreateMainFrame()
   end)
   frame:AddChild(adminButton)
 
+  local refreshGuildBtn = AceGUI:Create("Button")
+  refreshGuildBtn:SetText("Refresh Guild Members")
+  refreshGuildBtn:SetWidth(180)
+  refreshGuildBtn:SetCallback("OnClick", function()
+    if GLD:IsAdmin() then
+      GLD:RefreshFromGuildRoster()
+    else
+      GLD:Print("you do not have Guild Permission to access this panel")
+    end
+  end)
+  frame:AddChild(refreshGuildBtn)
+
   local sessionStart = AceGUI:Create("Button")
   sessionStart:SetText("Start Session")
   sessionStart:SetWidth(120)
@@ -117,6 +129,23 @@ function UI:CreateMainFrame()
     end
   end)
   frame:AddChild(sessionEnd)
+
+  local guestGroup = AceGUI:Create("InlineGroup")
+  guestGroup:SetTitle("Guest Anchors (Non-guild Party/Raid)")
+  guestGroup:SetFullWidth(true)
+  guestGroup:SetHeight(80)
+  guestGroup:SetLayout("Fill")
+
+  local guestScroll = AceGUI:Create("ScrollFrame")
+  guestScroll:SetLayout("Flow")
+  guestGroup:AddChild(guestScroll)
+
+  frame:AddChild(guestGroup)
+
+  local guestSpacer = AceGUI:Create("SimpleGroup")
+  guestSpacer:SetFullWidth(true)
+  guestSpacer:SetHeight(15)
+  frame:AddChild(guestSpacer)
 
   local rosterGroup = AceGUI:Create("SimpleGroup")
   rosterGroup:SetFullWidth(true)
@@ -145,6 +174,8 @@ function UI:CreateMainFrame()
   self.showAbsent = true
   self.filterText = ""
   self.scroll = scroll
+  self.guestGroup = guestGroup
+  self.guestScroll = guestScroll
 end
 
 function UI:CreatePendingFrame()
@@ -227,6 +258,10 @@ function UI:RefreshMain()
 
   self.header:SetText("My Position: " .. myPos)
 
+  GLD:UpdateGuestAttendanceFromGroup()
+
+  self:RefreshGuestAnchors(isAdmin)
+
   self.scroll:ReleaseChildren()
 
   local entries = self:GetRosterEntries(isAdmin)
@@ -235,6 +270,107 @@ function UI:RefreshMain()
   for _, entry in ipairs(entries) do
     self:AddRosterRow(entry, isAdmin)
     self:AddDivider()
+  end
+end
+
+function UI:RefreshGuestAnchors(isAdmin)
+  if not self.guestScroll then
+    return
+  end
+
+  self.guestScroll:ReleaseChildren()
+
+  local existingGuests = {}
+  for key, player in pairs(GLD.db.players or {}) do
+    if player and player.source == "guest" then
+      existingGuests[key] = true
+    end
+  end
+
+  local units = {}
+  local function addUnit(unit)
+    if not UnitExists(unit) or not UnitIsConnected(unit) then
+      return
+    end
+    if UnitIsUnit(unit, "player") then
+      return
+    end
+    if UnitIsInMyGuild and UnitIsInMyGuild(unit) then
+      return
+    end
+    local key = NS:GetPlayerKeyFromUnit(unit)
+    if key and existingGuests[key] then
+      return
+    end
+    units[#units + 1] = unit
+  end
+
+  if IsInRaid() then
+    for i = 1, GetNumGroupMembers() do
+      addUnit("raid" .. i)
+    end
+  elseif IsInGroup() then
+    for i = 1, GetNumSubgroupMembers() do
+      addUnit("party" .. i)
+    end
+  end
+
+  if #units == 0 then
+    local empty = AceGUI:Create("Label")
+    empty:SetText("No non-guild party/raid members found.")
+    empty:SetFullWidth(true)
+    self.guestScroll:AddChild(empty)
+    if self.guestGroup then
+      self.guestGroup:SetHeight(60)
+    end
+    return
+  end
+
+  for _, unit in ipairs(units) do
+    local row = AceGUI:Create("SimpleGroup")
+    row:SetFullWidth(true)
+    row:SetLayout("Flow")
+
+    local name, realm = UnitName(unit)
+    local classFile = select(2, UnitClass(unit))
+    local displayName = name or "?"
+    if realm and realm ~= "" then
+      displayName = displayName .. "-" .. realm
+    end
+
+    local classLabel = AceGUI:Create("Label")
+    classLabel:SetText(NS:GetClassIcon(classFile))
+    classLabel:SetWidth(30)
+    row:AddChild(classLabel)
+
+    local nameLabel = AceGUI:Create("Label")
+    nameLabel:SetText(displayName)
+    nameLabel:SetWidth(200)
+    row:AddChild(nameLabel)
+
+    local addBtn = AceGUI:Create("Button")
+    addBtn:SetText("Add Guest")
+    addBtn:SetWidth(100)
+    addBtn:SetCallback("OnClick", function()
+      if GLD:IsAdmin() then
+        GLD:AddGuestFromUnit(unit)
+        UI:RefreshMain()
+      else
+        GLD:Print("you do not have Guild Permission to access this panel")
+      end
+    end)
+    if not isAdmin and addBtn.SetDisabled then
+      addBtn:SetDisabled(true)
+    end
+    row:AddChild(addBtn)
+
+    self.guestScroll:AddChild(row)
+  end
+
+  if self.guestGroup then
+    local rowHeight = 26
+    local padding = 24
+    self.guestGroup:SetHeight((#units * rowHeight) + padding)
   end
 end
 
@@ -488,6 +624,7 @@ function UI:GetRosterEntries(isAdmin)
         attendance = player.attendance,
         numAccepted = player.numAccepted,
         attendanceCount = player.attendanceCount,
+        source = player.source,
       })
     end
   else
@@ -594,7 +731,13 @@ function UI:AddRosterRow(entry, isAdmin)
   row:AddChild(roleLabel)
 
   local nameLabel = AceGUI:Create("Label")
-  nameLabel:SetText(entry.name or "?")
+  local nameText = entry.name or "?"
+  if isAdmin and entry.source == "guest" then
+    nameText = nameText .. " (Guest)"
+  elseif isAdmin and entry.source == "test" then
+    nameText = nameText .. " (Test)"
+  end
+  nameLabel:SetText(nameText)
   nameLabel:SetWidth(180)
   row:AddChild(nameLabel)
 

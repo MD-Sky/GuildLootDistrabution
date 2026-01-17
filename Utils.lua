@@ -126,3 +126,161 @@ function GLD:UpsertPlayerFromUnit(unit)
   end
   return key
 end
+
+function GLD:AddGuestFromUnit(unit)
+  if not unit or not UnitExists(unit) then
+    return
+  end
+  local key = NS:GetPlayerKeyFromUnit(unit)
+  if not key then
+    return
+  end
+
+  local name, realm = UnitName(unit)
+  if not name then
+    return
+  end
+  local classFile = select(2, UnitClass(unit))
+  local player = self.db.players[key]
+  if not player then
+    player = {
+      name = name,
+      realm = realm or GetRealmName(),
+      class = classFile,
+      attendance = "PRESENT",
+      queuePos = nil,
+      savedPos = nil,
+      numAccepted = 0,
+      lastWinAt = 0,
+      isHonorary = false,
+      attendanceCount = 0,
+    }
+    self.db.players[key] = player
+  else
+    player.name = name or player.name
+    player.realm = realm or player.realm
+    player.class = classFile or player.class
+    player.attendance = player.attendance or "PRESENT"
+  end
+  player.source = "guest"
+
+  self:EnsureQueuePositions()
+  self:BroadcastSnapshot()
+  if self.UI then
+    self.UI:RefreshMain()
+  end
+  self:Print("Added guest: " .. name)
+end
+
+function GLD:RefreshFromGuildRoster()
+  if not IsInGuild() then
+    self:Print("You are not in a guild.")
+    return
+  end
+
+  if GuildRoster then
+    GuildRoster()
+  end
+
+  local attempts = 0
+  local function rebuild()
+    attempts = attempts + 1
+    local count = GetNumGuildMembers and GetNumGuildMembers() or 0
+    if (not count or count == 0) and attempts < 6 then
+      C_Timer.After(0.4, rebuild)
+      return
+    end
+
+    local keep = {}
+    for key, player in pairs(self.db.players or {}) do
+      if player and (player.source == "guest" or player.source == "test") then
+        keep[key] = player
+      end
+    end
+
+    self.db.players = {}
+    self.db.queue = {}
+
+    local realmName = GetRealmName()
+    for i = 1, (count or 0) do
+      local name, _, _, _, _, _, _, _, _, _, classFileName, _, _, _, _, _, guid = GetGuildRosterInfo(i)
+      if name then
+        local base, realm = NS:SplitNameRealm(name)
+        local key = (guid and guid ~= "" and guid) or (base .. "-" .. (realm or realmName))
+        self.db.players[key] = {
+          name = base,
+          realm = realm or realmName,
+          class = classFileName,
+          attendance = "ABSENT",
+          queuePos = nil,
+          savedPos = nil,
+          numAccepted = 0,
+          lastWinAt = 0,
+          isHonorary = false,
+          attendanceCount = 0,
+          source = "guild",
+        }
+      end
+    end
+
+    for key, player in pairs(keep) do
+      if not self.db.players[key] then
+        self.db.players[key] = player
+      end
+    end
+
+    self.shadow.roster = {}
+    self.shadow.my.queuePos = nil
+    self.shadow.my.attendance = nil
+
+    self:AutoMarkCurrentGroup()
+    self:EnsureQueuePositions()
+    self:BroadcastSnapshot()
+    if self.UI then
+      self.UI:RefreshMain()
+    end
+    self:Print("Guild roster loaded.")
+  end
+
+  C_Timer.After(0.4, rebuild)
+end
+
+function GLD:UpdateGuestAttendanceFromGroup()
+  if not self.db or not self.db.players then
+    return
+  end
+
+  local present = {}
+  local function addUnit(unit)
+    if not UnitExists(unit) or not UnitIsConnected(unit) then
+      return
+    end
+    local key = NS:GetPlayerKeyFromUnit(unit)
+    if key then
+      present[key] = true
+    end
+  end
+
+  if IsInRaid() then
+    for i = 1, GetNumGroupMembers() do
+      addUnit("raid" .. i)
+    end
+  elseif IsInGroup() then
+    for i = 1, GetNumSubgroupMembers() do
+      addUnit("party" .. i)
+    end
+    addUnit("player")
+  else
+    addUnit("player")
+  end
+
+  for key, player in pairs(self.db.players) do
+    if player and player.source == "guest" then
+      if present[key] then
+        self:SetAttendance(key, "PRESENT")
+      else
+        self:SetAttendance(key, "ABSENT")
+      end
+    end
+  end
+end

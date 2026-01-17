@@ -30,6 +30,7 @@ Comms.lua
 Item.lua
 Loot.lua
 Config.lua
+UnitPopup.lua
 GuildUI.lua
 Minimap.lua
 TestData.lua

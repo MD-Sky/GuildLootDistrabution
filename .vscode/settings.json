@@ -46,7 +46,12 @@
         "LOOT_ROLL_TYPE_GREED",
         "LOOT_ROLL_TYPE_PASS",
         "RAID_CLASS_COLORS",
-        "CommunitiesFrame"
+        "CommunitiesFrame",
+        "UIDropDownMenu_AddButton",
+        "UIDropDownMenu_CreateInfo",
+        "UnitPopup_OpenMenu",
+        "UIDROPDOWNMENU_MENU_LEVEL",
+        "UnitPopupMenus"
     ],
     "Lua.type.weakUnionCheck": true
 }

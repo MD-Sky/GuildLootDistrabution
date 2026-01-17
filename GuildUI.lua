@@ -13,9 +13,9 @@ function GLD:TryCreateGuildUIButton()
   end
 
   local btn = CreateFrame("Button", "GLD_GuildButton", parent, "UIPanelButtonTemplate")
-  btn:SetSize(70, 22)
+  btn:SetSize(50, 50)
   btn:SetText("GLD")
-  btn:SetPoint("TOPLEFT", parent, "TOPLEFT", 12, -2)
+  btn:SetPoint("CENTER", parent, "TOPLEFT", 25, -20)
 
   btn:SetScript("OnClick", function()
     if self.UI and self.UI.ToggleMain then

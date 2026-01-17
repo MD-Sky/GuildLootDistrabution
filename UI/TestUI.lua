@@ -421,7 +421,7 @@ function TestUI:CreateTestFrame()
 
   local rightColumn = AceGUI:Create("ScrollFrame")
   rightColumn:SetFullWidth(true)
-  rightColumn:SetHeight(520)
+  rightColumn:SetHeight(465)
   rightColumn:SetLayout("List")
   columns:AddChild(rightColumn)
 
