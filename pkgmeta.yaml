@@ -1,0 +1,8 @@
+package-as: GuildLootDistrabution
+
+ignore:
+  - .git/**
+  - .vscode/**
+  - pkgmeta.yaml
+
+noexternals: true
