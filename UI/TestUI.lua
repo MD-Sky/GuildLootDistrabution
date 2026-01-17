@@ -589,12 +589,39 @@ function TestUI:ToggleTestPanel()
   end
   if self.testFrame:IsShown() then
     self.testFrame:Hide()
+    if self.lootFrame then
+      self.lootFrame:Hide()
+    end
   else
     self:ResetTestVotes()
     self.testFrame:Show()
+    if self.lootFrame then
+      self.lootFrame:Show()
+      self:UpdateLootFrameToggle()
+    end
     GLD:Print("Test panel opened")
     self:RefreshTestPanel()
   end
+end
+
+function TestUI:UpdateLootFrameToggle()
+  if not self.lootToggleBtn then
+    return
+  end
+  local open = self.lootFrame and self.lootFrame:IsShown()
+  self.lootToggleBtn:SetText(open and ">" or "<")
+end
+
+function TestUI:ToggleLootFrame()
+  if not self.lootFrame then
+    return
+  end
+  if self.lootFrame:IsShown() then
+    self.lootFrame:Hide()
+  else
+    self.lootFrame:Show()
+  end
+  self:UpdateLootFrameToggle()
 end
 
 function TestUI:CreateTestFrame()
@@ -602,9 +629,20 @@ function TestUI:CreateTestFrame()
   frame:SetTitle("Admin Test Panel")
   frame:SetStatusText("Test Session / Loot / Variables")
   frame:SetWidth(900)
-  frame:SetHeight(560)
+  frame:SetHeight(600)
   frame:SetLayout("Flow")
   frame:EnableResize(false)
+
+  if frame.frame then
+    local toggleBtn = CreateFrame("Button", nil, frame.frame, "UIPanelButtonTemplate")
+    toggleBtn:SetSize(18, 40)
+    toggleBtn:SetPoint("LEFT", frame.frame, "LEFT", -8, 0)
+    toggleBtn:SetText(">")
+    toggleBtn:SetScript("OnClick", function()
+      TestUI:ToggleLootFrame()
+    end)
+    self.lootToggleBtn = toggleBtn
+  end
 
   local columns = AceGUI:Create("SimpleGroup")
   columns:SetFullWidth(true)
@@ -614,7 +652,7 @@ function TestUI:CreateTestFrame()
 
   local rightColumn = AceGUI:Create("ScrollFrame")
   rightColumn:SetFullWidth(true)
-  rightColumn:SetHeight(465)
+  rightColumn:SetFullHeight(true)
   rightColumn:SetLayout("List")
   columns:AddChild(rightColumn)
 
@@ -722,13 +760,18 @@ function TestUI:CreateTestFrame()
   lootFrame:SetTitle("Test Loot Choices")
   lootFrame:SetStatusText("Loot")
   lootFrame:SetWidth(320)
-  lootFrame:SetHeight(560)
+  lootFrame:SetHeight(600)
   lootFrame:SetLayout("Flow")
   lootFrame:EnableResize(false)
   if lootFrame.frame then
     lootFrame.frame:ClearAllPoints()
     lootFrame.frame:SetPoint("RIGHT", frame.frame, "LEFT", -10, 0)
   end
+
+  lootFrame:SetCallback("OnClose", function(widget)
+    widget:Hide()
+    TestUI:UpdateLootFrameToggle()
+  end)
 
   local instanceSelect = AceGUI:Create("Dropdown")
   instanceSelect:SetLabel("Raid")
@@ -822,10 +865,16 @@ function TestUI:CreateTestFrame()
   lootListGroup:SetFullWidth(true)
   lootListGroup:SetLayout("Fill")
 
+  local lootListSpacer = AceGUI:Create("SimpleGroup")
+  lootListSpacer:SetFullWidth(true)
+  lootListSpacer:SetHeight(5)
+
   local lootScroll = AceGUI:Create("ScrollFrame")
   lootScroll:SetLayout("Flow")
   lootListGroup:AddChild(lootScroll)
   lootFrame:AddChild(lootListGroup)
+
+  lootFrame:AddChild(lootListSpacer)
 
   self.testFrame = frame
   self.sessionStatus = sessionStatus
@@ -844,6 +893,8 @@ function TestUI:CreateTestFrame()
   self.itemArmorLabel = itemArmorLabel
   self.itemLinkInput2 = itemLinkInput2
   self.itemArmorLabel2 = itemArmorLabel2
+
+  self:UpdateLootFrameToggle()
 
   instanceSelect:SetCallback("OnValueChanged", function(_, _, value)
     TestUI:SelectInstance(value)
