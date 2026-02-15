@@ -18,6 +18,154 @@ local function LBPrint(msg, force)
   end
 end
 
+local function EnsureLootRollBlockerDB()
+  if not GLD or not GLD.db then
+    return nil
+  end
+  GLD.db.lootRollBlocker = GLD.db.lootRollBlocker or {}
+  local db = GLD.db.lootRollBlocker
+  if db.enabled == nil then
+    db.enabled = true
+  end
+  if db.isBlocking == nil then
+    db.isBlocking = false
+  end
+  if db.needsRecovery == nil then
+    db.needsRecovery = false
+  end
+  return db
+end
+
+function GLD:EnsureLootRollBlockerDB()
+  return EnsureLootRollBlockerDB()
+end
+
+function GLD:GetLocalVoteState(session)
+  if not session then
+    return nil
+  end
+  session.localVoteState = session.localVoteState or {
+    hasVoted = false,
+    voteValue = nil,
+    dismissedWithoutVote = false,
+    lastPromptedAt = nil,
+  }
+  return session.localVoteState
+end
+
+function GLD:RecordLocalVote(session, vote)
+  if not session then
+    return
+  end
+  local state = self:GetLocalVoteState(session)
+  if not state then
+    return
+  end
+  if state.hasVoted and state.voteValue == vote then
+    return
+  end
+  state.hasVoted = true
+  state.voteValue = vote
+  state.dismissedWithoutVote = false
+  if self.LilyDebug then
+    local playerName = self.GetUnitFullName and self:GetUnitFullName("player") or UnitName("player") or "player"
+    local itemRef = session.itemLink or session.itemID or session.itemName or "unknown"
+    self:LilyDebug(
+      string.format(
+        "[VOTE] VoteRecorded player=%s item=%s value=%s",
+        tostring(playerName),
+        tostring(itemRef),
+        tostring(vote)
+      )
+    )
+  end
+end
+
+function GLD:MarkLocalVoteDismissed(session)
+  if not session then
+    return
+  end
+  local state = self:GetLocalVoteState(session)
+  if not state or state.hasVoted then
+    return
+  end
+  state.dismissedWithoutVote = true
+end
+
+function GLD:GetLocalVoteValue(session)
+  if not session or not session.votes then
+    return nil
+  end
+  local localKey = NS:GetPlayerKeyFromUnit("player")
+  if not localKey then
+    return nil
+  end
+  if session.votes[localKey] ~= nil then
+    return session.votes[localKey]
+  end
+  if self.GetRollCandidateKey then
+    local alt = self:GetRollCandidateKey(localKey)
+    if alt and session.votes[alt] ~= nil then
+      return session.votes[alt]
+    end
+  end
+  local provider = session.isTest and TestProvider or LiveProvider
+  if provider and provider.GetPlayerName then
+    local name = provider:GetPlayerName(localKey)
+    if name and session.votes[name] ~= nil then
+      return session.votes[name]
+    end
+  end
+  return nil
+end
+
+function GLD:SyncLocalVoteState(session)
+  local vote = self:GetLocalVoteValue(session)
+  if vote ~= nil then
+    self:RecordLocalVote(session, vote)
+  end
+end
+
+local function IsLocalWinnerForResult(result)
+  if not result then
+    return false
+  end
+  local localKey = NS.GetPlayerKeyFromUnit and NS:GetPlayerKeyFromUnit("player") or nil
+  local localFull = GLD.GetUnitFullName and GLD:GetUnitFullName("player") or nil
+  local localShort = UnitName("player")
+  if localKey and result.winnerKey and result.winnerKey == localKey then
+    return true
+  end
+  if localFull and result.winnerName and result.winnerName == localFull then
+    return true
+  end
+  if localShort and result.winnerShortName and result.winnerShortName == localShort then
+    return true
+  end
+  return false
+end
+
+function GLD:ApplyCoverOutcomeForResult(result, isWinner)
+  if not result or not result.rollID then
+    return
+  end
+  if not self.SetCoverOverride then
+    return
+  end
+  local guid = UnitGUID("player")
+  if not guid then
+    return
+  end
+  if isWinner == nil then
+    isWinner = IsLocalWinnerForResult(result)
+  end
+  local mode = isWinner and "WINNER" or "LOSER"
+  self:SetCoverOverride(result.rollID, guid, mode, false)
+  if self.IsDebugEnabled and self:IsDebugEnabled() then
+    self:Debug("Cover result applied: rollID=" .. tostring(result.rollID) .. " mode=" .. tostring(mode))
+  end
+end
+
 do
   local version = NS.VERSION
   if not version and GetAddOnMetadata and NS.ADDON_NAME then
@@ -42,6 +190,10 @@ end
 
 function GLD:InitLoot()
   self.activeRolls = {}
+  if self.InitLootSessionController then
+    self:InitLootSessionController()
+  end
+  EnsureLootRollBlockerDB()
   self:RegisterEvent("START_LOOT_ROLL", "OnStartLootRoll")
   self:RegisterEvent("CANCEL_LOOT_ROLL", "OnCancelLootRoll")
   self:RegisterEvent("PLAYER_LOGIN", "OnCoverLogin")
@@ -55,6 +207,10 @@ function GLD:InitLoot()
   end
   SLASH_LBLOCK1 = "/lblock"
   SlashCmdList["LBLOCK"] = function(msg)
+    if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+      LBPrint("Loot blocker command ignored: loot session is not active.", true)
+      return
+    end
     local mode = tostring(msg or ""):lower():gsub("%s+", "")
     if mode == "" then
       mode = "lock_all"
@@ -88,6 +244,9 @@ function GLD:InitLoot()
   if C_Timer and C_Timer.NewTicker then
     -- Periodic cleanup to keep roll data from growing in long sessions.
     self.cleanupTicker = C_Timer.NewTicker(300, function()
+      if self.IsEnabled and not self:IsEnabled() then
+        return
+      end
       if self.CleanupActiveRolls then
         self:CleanupActiveRolls(1800)
       else
@@ -97,6 +256,12 @@ function GLD:InitLoot()
   end
   if self.InitCoverAuthority then
     self:InitCoverAuthority()
+  end
+  if self.InitLootRollBootProtection then
+    self:InitLootRollBootProtection()
+  end
+  if self.RefreshLootControllerFromPersistence then
+    self:RefreshLootControllerFromPersistence("InitLoot")
   end
 end
 
@@ -169,7 +334,7 @@ local function CreateBlocker(button)
   end
   local texture = blocker:CreateTexture(nil, "BACKGROUND")
   texture:SetAllPoints()
-  texture:SetTexture("Interface\\AddOns\\lilyUI\\Media\\ClickDenied.tga")
+  texture:SetTexture("Interface\\AddOns\\GuildLootDistribution\\media\\ClickDenied.tga")
   texture:SetAlpha(0.9)
   blocker._gldTexture = texture
   blocker:Hide()
@@ -247,12 +412,17 @@ function RollBlockers.EnsureForRollFrame(rollFrame)
   end
   if not rollFrame._gldBlockerHooksSet then
     rollFrame:HookScript("OnShow", function()
+      local source = "RollBlockers.OnShow"
       if rollFrame._gldBlockerNeedsOnShow then
         local mode = rollFrame._gldBlockerOnShowMode or "LOCK_ALL"
         rollFrame._gldBlockerNeedsOnShow = nil
         rollFrame._gldBlockerOnShowMode = nil
         LBPrint("OnShow reapply " .. tostring(mode) .. " for " .. tostring(rollFrame:GetName() or rollFrame))
         RollBlockers.SetMode(rollFrame, mode)
+        source = source .. ".reapply"
+      end
+      if GLD and GLD.OnObservedLootRollFrameShown then
+        GLD:OnObservedLootRollFrameShown(rollFrame, source)
       end
     end)
     rollFrame:HookScript("OnHide", function()
@@ -340,6 +510,11 @@ function RollBlockers.SetMode(rollFrame, mode)
   if not blockers then
     return
   end
+  rollFrame._gldBlockerMode = mode
+  if mode == "UNLOCK_ALL" then
+    rollFrame._gldBlockerNeedsOnShow = nil
+    rollFrame._gldBlockerOnShowMode = nil
+  end
   if LBDebugEnabled() then
     local name = rollFrame and (rollFrame.GetName and rollFrame:GetName() or tostring(rollFrame)) or "unknown"
     LBPrint("SetMode " .. tostring(mode) .. " for " .. tostring(name))
@@ -369,29 +544,22 @@ function RollBlockers.SetMode(rollFrame, mode)
     ShowForButton("greed", true)
     ShowForButton("transmog", true)
     ShowForButton("pass", true)
-    ApplyHighlights(rollFrame, mode)
-    return
-  end
-  if mode == "WINNER" then
+  elseif mode == "WINNER" then
     ShowForButton("need", false)
     ShowForButton("greed", false)
     ShowForButton("transmog", false)
     ShowForButton("pass", true)
-    ApplyHighlights(rollFrame, mode)
-    return
-  end
-  if mode == "LOSER" then
+  elseif mode == "LOSER" then
     ShowForButton("need", true)
     ShowForButton("greed", true)
     ShowForButton("transmog", true)
     ShowForButton("pass", false)
-    ApplyHighlights(rollFrame, mode)
-    return
+  else
+    ShowForButton("need", false)
+    ShowForButton("greed", false)
+    ShowForButton("transmog", false)
+    ShowForButton("pass", false)
   end
-  ShowForButton("need", false)
-  ShowForButton("greed", false)
-  ShowForButton("transmog", false)
-  ShowForButton("pass", false)
   ApplyHighlights(rollFrame, mode)
 end
 
@@ -460,6 +628,930 @@ local function FindRollFrameByID(rollID)
   return nil
 end
 
+local LOOT_BOOT_GLOBAL_HOOKS = {
+  "GroupLootFrame_OpenNewFrame",
+  "GroupLootContainer_AddFrame",
+  "GroupLootContainer_OpenNewFrame",
+}
+
+local LOOT_BOOT_CONTAINER_METHOD_HOOKS = {
+  "AddFrame",
+  "OpenNewFrame",
+}
+
+local LOOT_BOOT_CONTAINER_FRAME_TABLES = {
+  "rollFrames",
+  "activeFrames",
+  "frames",
+}
+
+local function IsFrameObject(value)
+  return type(value) == "table" and value.GetObjectType and value:IsObjectType("Frame")
+end
+
+local function IsBlockingMode(mode)
+  return mode == "LOCK_ALL" or mode == "WINNER" or mode == "LOSER"
+end
+
+function GLD:IsLootRollBlockModeActive()
+  local db = EnsureLootRollBlockerDB()
+  if not self:AreLootBlockersEnabled() then
+    if db then
+      db.isBlocking = false
+    end
+    return false
+  end
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    if db then
+      db.isBlocking = false
+    end
+    return false
+  end
+  if db and db.enabled == false then
+    db.isBlocking = false
+    return false
+  end
+  if self.GetPugsInRaid and self:GetPugsInRaid() then
+    if db then
+      db.isBlocking = false
+    end
+    return false
+  end
+  local mode = self.GetCoverAutoMode and self:GetCoverAutoMode() or "LOCK_ALL"
+  local active = mode ~= "UNLOCK_ALL"
+  if db then
+    db.isBlocking = active
+  end
+  return active
+end
+
+function GLD:EnsureLootBootState()
+  if not self._lootBootState then
+    local ui = self.GetUIConfig and self:GetUIConfig() or nil
+    local blockersEnabled = true
+    local tutorialActive = false
+    if ui then
+      if ui.tutorialBlockersEnabled ~= nil then
+        blockersEnabled = ui.tutorialBlockersEnabled == true
+      end
+      tutorialActive = ui.tutorialActive == true
+    end
+    self._lootBootState = {
+      hooksInstalled = false,
+      scanCompleted = false,
+      lastScan = nil,
+      lateScanPending = false,
+      bootGuardArmed = true,
+      sawPlayerLogin = false,
+      sawEnteringWorld = false,
+      globalHooks = {},
+      containerMethodHooks = {},
+      blockersEnabled = blockersEnabled,
+      tutorialActive = tutorialActive,
+      pendingDisableAllBlockers = false,
+      pendingDisableReason = nil,
+    }
+  end
+  return self._lootBootState
+end
+
+function GLD:AreLootBlockersEnabled()
+  local state = self:EnsureLootBootState()
+  if state.blockersEnabled == nil then
+    state.blockersEnabled = true
+  end
+  return state.blockersEnabled == true
+end
+
+function GLD:SetTutorialBlockersActive(active)
+  local state = self:EnsureLootBootState()
+  active = active == true
+  state.tutorialActive = active
+  state.blockersEnabled = active
+
+  local ui = self.GetUIConfig and self:GetUIConfig() or nil
+  if ui then
+    ui.tutorialActive = active
+    ui.tutorialBlockersEnabled = active
+  end
+
+  local db = EnsureLootRollBlockerDB()
+  if db then
+    db.enabled = active
+    if not active then
+      db.isBlocking = false
+      db.needsRecovery = false
+    end
+  end
+end
+
+function GLD:StopLootBootLateScan(reason)
+  local state = self:EnsureLootBootState()
+  state.lateScanPending = false
+  state.lateScanReason = reason or "stop"
+  state.lateScanTick = 0
+  if state.lateScanTicker and state.lateScanTicker.Cancel then
+    state.lateScanTicker:Cancel()
+  end
+  state.lateScanTicker = nil
+end
+
+function GLD:DisableAllBlockers(reason)
+  local state = self:EnsureLootBootState()
+  reason = reason or "unknown"
+
+  if InCombatLockdown and InCombatLockdown() then
+    state.pendingDisableAllBlockers = true
+    state.pendingDisableReason = reason
+    local eventFrame = self:EnsureLootBootEventFrame()
+    if eventFrame and eventFrame.RegisterEvent then
+      eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+    end
+    return false, "deferred"
+  end
+
+  self:DisableAllBlockersNow(reason, "immediate")
+  return true, "immediate"
+end
+
+function GLD:DisableAllBlockersNow(reason, source)
+  local state = self:EnsureLootBootState()
+  reason = reason or "unknown"
+  source = source or "immediate"
+
+  state.pendingDisableAllBlockers = false
+  state.pendingDisableReason = nil
+  state.blockersEnabled = false
+  state.tutorialActive = false
+
+  local ui = self.GetUIConfig and self:GetUIConfig() or nil
+  if ui then
+    ui.tutorialActive = false
+    ui.tutorialBlockersEnabled = false
+  end
+
+  local db = EnsureLootRollBlockerDB()
+  if db then
+    db.enabled = false
+    db.isBlocking = false
+    db.needsRecovery = false
+  end
+
+  self:ClearLootRollInterception("DisableAllBlockers:" .. tostring(reason), false)
+
+  local trackedFrames = {}
+  for rollFrame in pairs(RollBlockers.byFrame or {}) do
+    trackedFrames[#trackedFrames + 1] = rollFrame
+  end
+  for _, rollFrame in ipairs(trackedFrames) do
+    if rollFrame then
+      rollFrame._gldBlockerNeedsOnShow = nil
+      rollFrame._gldBlockerOnShowMode = nil
+      RollBlockers.SetMode(rollFrame, "UNLOCK_ALL")
+      RollBlockers.ReleaseForRollFrame(rollFrame)
+    end
+  end
+
+  if reason == "tutorial_finished" and self.IsDebugEnabled and self:IsDebugEnabled() then
+    self:Debug("[Tutorial] Finish -> DisableAllBlockers (" .. tostring(source) .. ")")
+  end
+end
+
+function GLD:ClearLootRollInterception(reason, clearActiveRolls)
+  local state = self:EnsureLootBootState()
+  self:StopLootBootLateScan("clear:" .. tostring(reason))
+  state.waitingForCombatUnlock = nil
+  state.bootGuardArmed = false
+  state.scanCompleted = false
+  state.lastScan = nil
+  if state.eventFrame and state.eventFrame.UnregisterEvent then
+    state.eventFrame:UnregisterEvent("PLAYER_REGEN_ENABLED")
+  end
+  self:SetLootBootGuardEnabled(false, "clear:" .. tostring(reason))
+
+  local frames = self.CollectLootRollFrames and self:CollectLootRollFrames() or {}
+  for _, rollFrame in ipairs(frames) do
+    if rollFrame then
+      rollFrame._gldBlockerNeedsOnShow = nil
+      rollFrame._gldBlockerOnShowMode = nil
+      RollBlockers.SetMode(rollFrame, "UNLOCK_ALL")
+      RollBlockers.ReleaseForRollFrame(rollFrame)
+    end
+  end
+
+  if self._rollFrameByRollID then
+    wipe(self._rollFrameByRollID)
+  end
+  if self._pendingRollFrameLookup then
+    wipe(self._pendingRollFrameLookup)
+  end
+  self._reapplyBlockersRetryPending = nil
+  self.coverAppliedModes = self.coverAppliedModes or {}
+  wipe(self.coverAppliedModes)
+  self.coverOverrides = self.coverOverrides or {}
+  wipe(self.coverOverrides)
+
+  if clearActiveRolls and self.activeRolls then
+    wipe(self.activeRolls)
+  end
+  if self.UI and self.UI.CloseLootSessionWindows then
+    self.UI:CloseLootSessionWindows("session_disabled")
+  elseif self.UI and self.UI.RefreshLootWindow then
+    self.UI:RefreshLootWindow()
+  end
+end
+
+function GLD:OnLootSessionEnabled(sessionId, reason)
+  local state = self:EnsureLootBootState()
+  state.bootGuardArmed = true
+  if self.IsDebugEnabled and self:IsDebugEnabled() then
+    self:Debug(
+      "Loot session enabled: sessionId="
+        .. tostring(sessionId or "nil")
+        .. " reason="
+        .. tostring(reason)
+    )
+  end
+  self:SetLootBootGuardEnabled(true, "enable:" .. tostring(reason))
+  self:RunLootBootBootstrap("enable:" .. tostring(reason))
+  self:StartLootBootLateScan("enable:" .. tostring(reason))
+  if self.ResumeCoverBlockers then
+    self:ResumeCoverBlockers()
+  end
+end
+
+function GLD:OnLootSessionDisabled(reason, _, options)
+  if self.IsDebugEnabled and self:IsDebugEnabled() then
+    self:Debug("Loot session disabled: reason=" .. tostring(reason))
+  end
+  self:ClearLootRollInterception(reason or "session_disabled", options and options.clearActiveRolls == true)
+end
+
+function GLD:EnsureLootBootEventFrame()
+  local state = self:EnsureLootBootState()
+  if state.eventFrame then
+    return state.eventFrame
+  end
+  local frame = CreateFrame("Frame", nil, UIParent)
+  frame:SetScript("OnEvent", function(_, event, ...)
+    if event == "ADDON_LOADED" then
+      local addonName = ...
+      if addonName == "Blizzard_GroupLootFrames" and GLD and GLD.OnLootBootBlizzardGroupLootLoaded then
+        GLD:OnLootBootBlizzardGroupLootLoaded(event, addonName)
+      end
+    elseif event == "PLAYER_ENTERING_WORLD" then
+      if GLD and GLD.OnLootBootPlayerEnteringWorld then
+        GLD:OnLootBootPlayerEnteringWorld(event)
+      end
+    elseif event == "PLAYER_REGEN_ENABLED" then
+      if GLD and GLD.OnLootBootCombatUnlocked then
+        GLD:OnLootBootCombatUnlocked(event)
+      end
+    end
+  end)
+  frame:RegisterEvent("ADDON_LOADED")
+  frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+  state.eventFrame = frame
+  return frame
+end
+
+function GLD:EnsureLootBootGuard()
+  local state = self:EnsureLootBootState()
+  if state.bootGuard then
+    return state.bootGuard
+  end
+  local guard = CreateFrame("Frame", nil, UIParent)
+  guard:SetFrameStrata("TOOLTIP")
+  guard:SetFrameLevel(10000)
+  guard:SetAllPoints(UIParent)
+  guard:EnableMouse(true)
+  if guard.SetPropagateMouseClicks then
+    guard:SetPropagateMouseClicks(false)
+  end
+  guard:SetScript("OnMouseDown", function()
+    if LBDebugEnabled() then
+      LBPrint("BootGuard intercepted click")
+    end
+  end)
+  guard:SetScript("OnMouseUp", function() end)
+  guard:Hide()
+  state.bootGuard = guard
+  return guard
+end
+
+function GLD:SetLootBootGuardEnabled(enabled, reason)
+  local state = self:EnsureLootBootState()
+  local guard = self:EnsureLootBootGuard()
+  enabled = enabled == true
+  if enabled and self.IsEnabled and not self:IsEnabled() then
+    enabled = false
+  end
+  if state.bootGuardEnabled == enabled then
+    return
+  end
+  state.bootGuardEnabled = enabled
+  if enabled then
+    guard:SetAllPoints(UIParent)
+    guard:Show()
+    if guard.Raise then
+      guard:Raise()
+    end
+    LBPrint("BootGuard enabled: " .. tostring(reason))
+  else
+    guard:Hide()
+    LBPrint("BootGuard disabled: " .. tostring(reason))
+  end
+end
+
+function GLD:GetLootRollIDFromFrame(rollFrame)
+  if not rollFrame then
+    return nil
+  end
+  local direct = {
+    rollFrame.rollID,
+    rollFrame.lootID,
+    rollFrame.LootID,
+    rollFrame.rollId,
+    rollFrame.lootId,
+  }
+  for _, value in ipairs(direct) do
+    local id = tonumber(value)
+    if id then
+      return id
+    end
+  end
+  local rollInfo = rollFrame.rollInfo
+  if type(rollInfo) == "table" then
+    local fromInfo = tonumber(rollInfo.rollID or rollInfo.lootID or rollInfo.rollId or rollInfo.lootId)
+    if fromInfo then
+      return fromInfo
+    end
+  end
+  if rollFrame.GetRollID then
+    local ok, id = pcall(rollFrame.GetRollID, rollFrame)
+    id = ok and tonumber(id) or nil
+    if id then
+      return id
+    end
+  end
+  if rollFrame.GetLootID then
+    local ok, id = pcall(rollFrame.GetLootID, rollFrame)
+    id = ok and tonumber(id) or nil
+    if id then
+      return id
+    end
+  end
+  return nil
+end
+
+function GLD:GetBlockModeForRollFrame(rollID, rollFrame)
+  local mode = nil
+  local playerGUID = UnitGUID("player")
+  if rollID and playerGUID and self.GetCoverOverrideMode then
+    mode = self:GetCoverOverrideMode(rollID, playerGUID)
+  end
+  if mode ~= "LOCK_ALL" and mode ~= "WINNER" and mode ~= "LOSER" and mode ~= "UNLOCK_ALL" then
+    mode = self.GetCoverAutoMode and self:GetCoverAutoMode() or nil
+  end
+  if mode ~= "LOCK_ALL" and mode ~= "WINNER" and mode ~= "LOSER" and mode ~= "UNLOCK_ALL" then
+    mode = rollFrame and rollFrame._gldBlockerMode or nil
+  end
+  if mode ~= "LOCK_ALL" and mode ~= "WINNER" and mode ~= "LOSER" and mode ~= "UNLOCK_ALL" then
+    mode = "LOCK_ALL"
+  end
+  return mode
+end
+
+function GLD:ApplyBlockerForRollFrame(rollID, rollFrame, reason)
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return false, nil
+  end
+  if not self:AreLootBlockersEnabled() then
+    return false, nil
+  end
+  if not rollFrame then
+    return false, nil
+  end
+  rollID = rollID or self:GetLootRollIDFromFrame(rollFrame)
+  local mode = self:GetBlockModeForRollFrame(rollID, rollFrame)
+  if rollID then
+    self._rollFrameByRollID = self._rollFrameByRollID or {}
+    self._rollFrameByRollID[rollID] = rollFrame
+  end
+  if mode == "UNLOCK_ALL" then
+    rollFrame._gldBlockerNeedsOnShow = nil
+    rollFrame._gldBlockerOnShowMode = nil
+  else
+    rollFrame._gldBlockerNeedsOnShow = true
+    rollFrame._gldBlockerOnShowMode = mode
+  end
+  RollBlockers.SetMode(rollFrame, mode)
+  LBPrint(
+    "ApplyBlocker: source="
+      .. tostring(reason or "unknown")
+      .. " rollID="
+      .. tostring(rollID)
+      .. " mode="
+      .. tostring(mode)
+      .. " frame="
+      .. tostring(rollFrame.GetName and rollFrame:GetName() or rollFrame)
+  )
+  return true, mode
+end
+
+function GLD:ApplyBlocker(rollID, rollFrame, reason)
+  return self:ApplyBlockerForRollFrame(rollID, rollFrame, reason)
+end
+
+function GLD:EnsureLootRollFrameOnShowHook(rollFrame, source)
+  if not rollFrame or not rollFrame.HookScript or rollFrame._gldBootOnShowHookSet then
+    return
+  end
+  rollFrame:HookScript("OnShow", function(frame)
+    if GLD and GLD.OnObservedLootRollFrameShown then
+      GLD:OnObservedLootRollFrameShown(frame, "Boot.OnShow")
+    end
+  end)
+  rollFrame._gldBootOnShowHookSet = true
+  LBPrint("OnShow hook installed for " .. tostring(rollFrame.GetName and rollFrame:GetName() or rollFrame) .. " source=" .. tostring(source))
+end
+
+function GLD:ObserveLootRollFrame(rollFrame, source, hintedRollID, applyNow)
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return false
+  end
+  if not IsFrameObject(rollFrame) then
+    return false
+  end
+  self:EnsureLootRollFrameOnShowHook(rollFrame, source)
+  RollBlockers.EnsureForRollFrame(rollFrame)
+  local rollID = hintedRollID or self:GetLootRollIDFromFrame(rollFrame)
+  if rollID then
+    self._rollFrameByRollID = self._rollFrameByRollID or {}
+    self._rollFrameByRollID[rollID] = rollFrame
+  end
+  if applyNow then
+    self:ApplyBlocker(rollID, rollFrame, source)
+  end
+  return true
+end
+
+function GLD:OnObservedLootRollFrameShown(rollFrame, source)
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
+  if not rollFrame then
+    return
+  end
+  local rollID = self:GetLootRollIDFromFrame(rollFrame)
+  if rollID then
+    self:ApplyBlocker(rollID, rollFrame, source or "OnShow")
+  elseif LBDebugEnabled() then
+    LBPrint("OnShow frame without rollID: " .. tostring(rollFrame.GetName and rollFrame:GetName() or rollFrame))
+  end
+  self:EvaluateLootBootGuardRelease("OnShow")
+end
+
+function GLD:OnLootRollHookTriggered(hookName, ...)
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
+  local rollID = nil
+  local rollFrame = nil
+  for i = 1, select("#", ...) do
+    local value = select(i, ...)
+    if not rollFrame and IsFrameObject(value) then
+      rollFrame = value
+    end
+    if rollID == nil and type(value) == "number" then
+      rollID = value
+    elseif rollID == nil and type(value) == "table" then
+      rollID = tonumber(value.rollID or value.lootID or value.LootID or value.rollId or value.lootId) or nil
+    end
+  end
+  if rollFrame then
+    self:ObserveLootRollFrame(rollFrame, "hook:" .. tostring(hookName), rollID, true)
+  end
+  if rollID then
+    local found = rollFrame or FindRollFrameByID(rollID)
+    if found then
+      self:ObserveLootRollFrame(found, "hook-find:" .. tostring(hookName), rollID, true)
+    elseif C_Timer and C_Timer.After then
+      C_Timer.After(0, function()
+        local delayed = FindRollFrameByID(rollID)
+        if delayed then
+          self:ObserveLootRollFrame(delayed, "hook-delay:" .. tostring(hookName), rollID, true)
+        end
+      end)
+    end
+  end
+  self:EvaluateLootBootGuardRelease("hook:" .. tostring(hookName))
+end
+
+function GLD:TryLoadBlizzardGroupLootFrames(reason)
+  if IsAddOnLoaded and IsAddOnLoaded("Blizzard_GroupLootFrames") then
+    return true
+  end
+  if not LoadAddOn then
+    return false
+  end
+  local state = self:EnsureLootBootState()
+  local eventFrame = self:EnsureLootBootEventFrame()
+  if InCombatLockdown and InCombatLockdown() then
+    state.waitingForCombatUnlock = true
+    if eventFrame and eventFrame.RegisterEvent then
+      eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+    end
+    LBPrint("Deferred Blizzard_GroupLootFrames load until combat ends (" .. tostring(reason) .. ")")
+    return false
+  end
+  local ok, loaded, loadReason = pcall(LoadAddOn, "Blizzard_GroupLootFrames")
+  local isLoaded = (ok and loaded) or (IsAddOnLoaded and IsAddOnLoaded("Blizzard_GroupLootFrames"))
+  if not isLoaded then
+    LBPrint("LoadAddOn Blizzard_GroupLootFrames failed: " .. tostring(loadReason) .. " source=" .. tostring(reason))
+    return false
+  end
+  state.waitingForCombatUnlock = nil
+  if eventFrame and eventFrame.UnregisterEvent then
+    eventFrame:UnregisterEvent("PLAYER_REGEN_ENABLED")
+  end
+  LBPrint("Blizzard_GroupLootFrames ready (" .. tostring(reason) .. ")")
+  return true
+end
+
+function GLD:InstallLootRollStartupHooks(reason)
+  local state = self:EnsureLootBootState()
+  if not self:TryLoadBlizzardGroupLootFrames(reason) then
+    if not state.waitingForCombatUnlock then
+      -- Fallback to scans even if explicit load failed; avoids a permanent guard lock.
+      state.hooksInstalled = true
+      LBPrint("Loot hooks fallback active (load unavailable): " .. tostring(reason))
+      return true
+    end
+    return false
+  end
+
+  for _, hookName in ipairs(LOOT_BOOT_GLOBAL_HOOKS) do
+    if not state.globalHooks[hookName] and type(_G[hookName]) == "function" then
+      hooksecurefunc(hookName, function(...)
+        if GLD and GLD.OnLootRollHookTriggered then
+          GLD:OnLootRollHookTriggered(hookName, ...)
+        end
+      end)
+      state.globalHooks[hookName] = true
+      LBPrint("Hook installed: " .. tostring(hookName))
+    end
+  end
+
+  if GroupLootContainer then
+    for _, methodName in ipairs(LOOT_BOOT_CONTAINER_METHOD_HOOKS) do
+      if not state.containerMethodHooks[methodName] and type(GroupLootContainer[methodName]) == "function" then
+        hooksecurefunc(GroupLootContainer, methodName, function(_, ...)
+          if GLD and GLD.OnLootRollHookTriggered then
+            GLD:OnLootRollHookTriggered("GroupLootContainer:" .. tostring(methodName), ...)
+          end
+        end)
+        state.containerMethodHooks[methodName] = true
+        LBPrint("Hook installed: GroupLootContainer:" .. tostring(methodName))
+      end
+    end
+  end
+
+  state.hooksInstalled = true
+  LBPrint("Loot hooks installed pass complete (" .. tostring(reason) .. ")")
+  return true
+end
+
+function GLD:IsLootRollFrameActive(rollFrame, rollID)
+  if not rollFrame then
+    return false
+  end
+  if rollID then
+    return true
+  end
+  if rollFrame.IsShown and rollFrame:IsShown() then
+    return true
+  end
+  if rollFrame._gldBlockerNeedsOnShow then
+    return true
+  end
+  return false
+end
+
+function GLD:CollectLootRollFrames()
+  local seen = {}
+  local frames = {}
+  local function AddFrame(frame)
+    if not IsFrameObject(frame) or seen[frame] then
+      return
+    end
+    seen[frame] = true
+    frames[#frames + 1] = frame
+  end
+
+  if GroupLootContainer then
+    for _, key in ipairs(LOOT_BOOT_CONTAINER_FRAME_TABLES) do
+      local frameTable = GroupLootContainer[key]
+      if type(frameTable) == "table" then
+        for _, frame in pairs(frameTable) do
+          AddFrame(frame)
+        end
+      end
+    end
+  end
+
+  if self._rollFrameByRollID then
+    for _, frame in pairs(self._rollFrameByRollID) do
+      AddFrame(frame)
+    end
+  end
+
+  local maxFrames = math.max(NUM_GROUP_LOOT_FRAMES or 0, NUM_LOOT_ROLLS or 0, 12)
+  for i = 1, maxFrames do
+    AddFrame(_G["GroupLootFrame" .. i])
+    AddFrame(_G["LootRollFrame" .. i])
+  end
+
+  return frames
+end
+
+function GLD:HasConfirmedBlockersForFrame(rollFrame, mode)
+  if not IsBlockingMode(mode) then
+    return true
+  end
+  local blockers = RollBlockers.byFrame[rollFrame]
+  if not blockers or not blockers.buttons then
+    return false
+  end
+  local hasAnyButton = false
+  for _, key in ipairs({ "need", "greed", "transmog", "pass" }) do
+    local button = blockers.buttons[key]
+    if button then
+      hasAnyButton = true
+      if not blockers[key] then
+        return false
+      end
+    end
+  end
+  return hasAnyButton
+end
+
+function GLD:ScanExistingLootRollFrames(reason)
+  local state = self:EnsureLootBootState()
+  local frames = self:CollectLootRollFrames()
+  local activeCount = 0
+  local appliedCount = 0
+  local unconfirmedCount = 0
+
+  for _, rollFrame in ipairs(frames) do
+    local rollID = self:GetLootRollIDFromFrame(rollFrame)
+    local isActive = self:IsLootRollFrameActive(rollFrame, rollID)
+    if isActive then
+      activeCount = activeCount + 1
+      self:ObserveLootRollFrame(rollFrame, "scan:" .. tostring(reason), rollID, false)
+      local applied, mode = self:ApplyBlocker(rollID, rollFrame, "scan:" .. tostring(reason))
+      if applied then
+        appliedCount = appliedCount + 1
+      end
+      if not self:HasConfirmedBlockersForFrame(rollFrame, mode) then
+        unconfirmedCount = unconfirmedCount + 1
+      end
+    end
+  end
+
+  local summary = {
+    reason = reason,
+    totalFrames = #frames,
+    activeCount = activeCount,
+    appliedCount = appliedCount,
+    unconfirmedCount = unconfirmedCount,
+  }
+  state.scanCompleted = true
+  state.lastScan = summary
+  LBPrint(
+    "Loot scan: reason="
+      .. tostring(reason)
+      .. " frames="
+      .. tostring(summary.totalFrames)
+      .. " active="
+      .. tostring(summary.activeCount)
+      .. " applied="
+      .. tostring(summary.appliedCount)
+      .. " unconfirmed="
+      .. tostring(summary.unconfirmedCount)
+  )
+  return summary
+end
+
+function GLD:CanReleaseLootBootGuard()
+  if not self:IsLootRollBlockModeActive() then
+    return true
+  end
+  local state = self:EnsureLootBootState()
+  if not state.hooksInstalled then
+    return false, "hooks-not-installed"
+  end
+  if not state.scanCompleted then
+    return false, "scan-not-complete"
+  end
+  if state.waitingForCombatUnlock then
+    return false, "combat-lockdown"
+  end
+  if not state.sawPlayerLogin and not state.sawEnteringWorld then
+    return false, "login-or-world-pending"
+  end
+  if state.lateScanPending then
+    return false, "late-scan-pending"
+  end
+  if self._reapplyBlockersRetryPending then
+    return false, "reapply-pending"
+  end
+  if self._pendingRollFrameLookup and next(self._pendingRollFrameLookup) then
+    return false, "frame-lookup-pending"
+  end
+  local scan = state.lastScan or {}
+  local active = tonumber(scan.activeCount) or 0
+  local unconfirmed = tonumber(scan.unconfirmedCount) or 0
+  if active == 0 then
+    return true, "no-active-frames"
+  end
+  if unconfirmed == 0 then
+    return true, "all-active-frames-confirmed"
+  end
+  return false, "active-frames-unconfirmed"
+end
+
+function GLD:EvaluateLootBootGuardRelease(reason)
+  if not self:IsLootRollBlockModeActive() then
+    local state = self:EnsureLootBootState()
+    state.bootGuardArmed = false
+    self:SetLootBootGuardEnabled(false, "not-block-mode:" .. tostring(reason))
+    return
+  end
+  local state = self:EnsureLootBootState()
+  local canRelease, gateReason = self:CanReleaseLootBootGuard()
+  if canRelease then
+    state.bootGuardArmed = false
+    self:SetLootBootGuardEnabled(false, "release:" .. tostring(gateReason) .. ":" .. tostring(reason))
+  elseif state.bootGuardArmed then
+    self:SetLootBootGuardEnabled(true, "hold:" .. tostring(gateReason) .. ":" .. tostring(reason))
+  end
+end
+
+function GLD:RunLootBootBootstrap(reason)
+  local state = self:EnsureLootBootState()
+  local eventFrame = self:EnsureLootBootEventFrame()
+  if self.RefreshLootControllerFromPersistence and (reason == "InitLoot" or reason == "PLAYER_LOGIN" or reason == "ADDON_LOADED") then
+    self:RefreshLootControllerFromPersistence("RunLootBootBootstrap:" .. tostring(reason))
+  end
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    state.bootGuardArmed = false
+    self:SetLootBootGuardEnabled(false, "disabled:" .. tostring(reason))
+    return
+  end
+  if not self:AreLootBlockersEnabled() then
+    state.bootGuardArmed = false
+    self:SetLootBootGuardEnabled(false, "blockers-disabled:" .. tostring(reason))
+    return
+  end
+  if not self:IsLootRollBlockModeActive() then
+    self:EvaluateLootBootGuardRelease(reason)
+    return
+  end
+  if InCombatLockdown and InCombatLockdown() then
+    state.waitingForCombatUnlock = true
+    if eventFrame and eventFrame.RegisterEvent then
+      eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+    end
+  else
+    state.waitingForCombatUnlock = nil
+    if eventFrame and eventFrame.UnregisterEvent then
+      eventFrame:UnregisterEvent("PLAYER_REGEN_ENABLED")
+    end
+  end
+  if state.bootGuardArmed then
+    self:SetLootBootGuardEnabled(true, "bootstrap:" .. tostring(reason))
+  end
+  self:InstallLootRollStartupHooks(reason)
+  self:ScanExistingLootRollFrames(reason)
+  self:EvaluateLootBootGuardRelease(reason)
+end
+
+function GLD:StartLootBootLateScan(reason)
+  local state = self:EnsureLootBootState()
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    self:StopLootBootLateScan("disabled:" .. tostring(reason))
+    return
+  end
+  state.lateScanPending = true
+  state.lateScanReason = reason
+  state.lateScanTick = 0
+  if state.lateScanTicker and state.lateScanTicker.Cancel then
+    state.lateScanTicker:Cancel()
+    state.lateScanTicker = nil
+  end
+  if not C_Timer or not C_Timer.NewTicker then
+    self:RunLootBootBootstrap("late-fallback:" .. tostring(reason))
+    state.lateScanPending = false
+    self:EvaluateLootBootGuardRelease("late-fallback-complete")
+    return
+  end
+  state.lateScanTicker = C_Timer.NewTicker(0.1, function()
+    local inner = GLD and GLD.EnsureLootBootState and GLD:EnsureLootBootState() or nil
+    if not inner then
+      return
+    end
+    inner.lateScanTick = (inner.lateScanTick or 0) + 1
+    LBPrint("Late scan tick " .. tostring(inner.lateScanTick) .. "/10 reason=" .. tostring(inner.lateScanReason))
+    if GLD and GLD.RunLootBootBootstrap then
+      GLD:RunLootBootBootstrap("late:" .. tostring(inner.lateScanReason) .. ":" .. tostring(inner.lateScanTick))
+    end
+    if inner.lateScanTick >= 10 then
+      if inner.lateScanTicker and inner.lateScanTicker.Cancel then
+        inner.lateScanTicker:Cancel()
+      end
+      inner.lateScanTicker = nil
+      inner.lateScanPending = false
+      LBPrint("Late scan ticker complete reason=" .. tostring(inner.lateScanReason))
+      if GLD and GLD.EvaluateLootBootGuardRelease then
+        GLD:EvaluateLootBootGuardRelease("late-scan-complete")
+      end
+    end
+  end)
+end
+
+function GLD:OnLootBootBlizzardGroupLootLoaded(_, addonName)
+  LBPrint("ADDON_LOADED: " .. tostring(addonName) .. " (loot bootstrap)")
+  if self.RefreshLootControllerFromPersistence then
+    self:RefreshLootControllerFromPersistence("ADDON_LOADED")
+  end
+  if self.IsEnabled and not self:IsEnabled() then
+    return
+  end
+  self:RunLootBootBootstrap("ADDON_LOADED")
+end
+
+function GLD:OnLootBootPlayerEnteringWorld(event)
+  if self.RefreshLootControllerFromPersistence then
+    self:RefreshLootControllerFromPersistence(event or "PLAYER_ENTERING_WORLD")
+  end
+  local state = self:EnsureLootBootState()
+  state.sawEnteringWorld = true
+  state.bootGuardArmed = self:IsLootRollBlockModeActive()
+  if self.IsEnabled and not self:IsEnabled() then
+    self:ClearLootRollInterception(event or "PLAYER_ENTERING_WORLD", false)
+    return
+  end
+  if not self:AreLootBlockersEnabled() then
+    self:ClearLootRollInterception(event or "PLAYER_ENTERING_WORLD", false)
+    return
+  end
+  LBPrint("PLAYER_ENTERING_WORLD loot bootstrap")
+  self:RunLootBootBootstrap(event or "PLAYER_ENTERING_WORLD")
+  self:StartLootBootLateScan("PLAYER_ENTERING_WORLD")
+end
+
+function GLD:OnLootBootCombatUnlocked(event)
+  local state = self:EnsureLootBootState()
+  if state.pendingDisableAllBlockers then
+    local pendingReason = state.pendingDisableReason or "unknown"
+    self:DisableAllBlockersNow(pendingReason, "deferred")
+    return
+  end
+  if self.IsEnabled and not self:IsEnabled() then
+    self:ClearLootRollInterception(event or "PLAYER_REGEN_ENABLED", false)
+    return
+  end
+  state.waitingForCombatUnlock = nil
+  state.bootGuardArmed = self:IsLootRollBlockModeActive()
+  local eventFrame = state.eventFrame
+  if eventFrame and eventFrame.UnregisterEvent then
+    eventFrame:UnregisterEvent("PLAYER_REGEN_ENABLED")
+  end
+  LBPrint("Combat unlocked; retrying loot bootstrap (" .. tostring(event) .. ")")
+  self:RunLootBootBootstrap(event or "PLAYER_REGEN_ENABLED")
+end
+
+function GLD:InitLootRollBootProtection()
+  local state = self:EnsureLootBootState()
+  self:EnsureLootBootEventFrame()
+  if self.RefreshLootControllerFromPersistence then
+    self:RefreshLootControllerFromPersistence("InitLootRollBootProtection")
+  end
+  if self.IsEnabled and not self:IsEnabled() then
+    state.bootGuardArmed = false
+    self:ClearLootRollInterception("InitLootRollBootProtection", true)
+    return
+  end
+  state.bootGuardArmed = self:IsLootRollBlockModeActive()
+  if self:IsLootRollBlockModeActive() then
+    self:SetLootBootGuardEnabled(true, "InitLoot")
+  else
+    self:SetLootBootGuardEnabled(false, "InitLoot")
+  end
+  self:RunLootBootBootstrap("InitLoot")
+end
+
 function RollBlockers.ApplyForRoll(rollID, mode)
   if not rollID then
     return nil
@@ -480,6 +1572,12 @@ function RollBlockers.ApplyForRoll(rollID, mode)
 end
 
 function GLD:LockLootRollButtons(rollID)
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
+  if not self:AreLootBlockersEnabled() then
+    return
+  end
   if not rollID then
     return
   end
@@ -496,7 +1594,12 @@ function GLD:LockLootRollButtons(rollID)
       if not self._pendingRollFrameLookup[rollID] then
         self._pendingRollFrameLookup[rollID] = true
         C_Timer.After(0, function()
-          self._pendingRollFrameLookup[rollID] = nil
+          if self._pendingRollFrameLookup then
+            self._pendingRollFrameLookup[rollID] = nil
+          end
+          if not (self.AreLootBlockersEnabled and self:AreLootBlockersEnabled()) then
+            return
+          end
           self:LockLootRollButtons(rollID)
         end)
       end
@@ -512,23 +1615,33 @@ function GLD:LockLootRollButtons(rollID)
   end
   self._rollFrameByRollID = self._rollFrameByRollID or {}
   self._rollFrameByRollID[rollID] = rollFrame
-  rollFrame._gldBlockerNeedsOnShow = true
-  rollFrame._gldBlockerOnShowMode = "LOCK_ALL"
-  RollBlockers.SetMode(rollFrame, "LOCK_ALL")
+  self:ObserveLootRollFrame(rollFrame, "START_LOOT_ROLL", rollID, false)
+  self:ApplyBlocker(rollID, rollFrame, "START_LOOT_ROLL")
   if LBDebugEnabled() then
     LBPrint("SetMode LOCK_ALL called")
   end
   if C_Timer and C_Timer.After then
     C_Timer.After(0, function()
-      RollBlockers.SetMode(rollFrame, "LOCK_ALL")
+      if not (self.AreLootBlockersEnabled and self:AreLootBlockersEnabled()) then
+        return
+      end
+      if self.ApplyBlocker then
+        self:ApplyBlocker(rollID, rollFrame, "START_LOOT_ROLL.nextFrame")
+      else
+        RollBlockers.SetMode(rollFrame, "LOCK_ALL")
+      end
       if LBDebugEnabled() then
         LBPrint("Reapplied next frame")
       end
     end)
   end
+  self:EvaluateLootBootGuardRelease("START_LOOT_ROLL")
 end
 
 function GLD:UnlockLootRollButtons(rollID)
+  if self.IsEnabled and not self:IsEnabled() then
+    return
+  end
   if not rollID then
     return
   end
@@ -560,6 +1673,7 @@ function GLD:UnlockLootRollButtons(rollID)
   if self._pendingRollFrameLookup then
     self._pendingRollFrameLookup[rollID] = nil
   end
+  self:RunLootBootBootstrap("CANCEL_LOOT_ROLL")
 end
 
 local function GetResumeMode(self, rollID, playerGUID)
@@ -570,72 +1684,150 @@ local function GetResumeMode(self, rollID, playerGUID)
   return mode
 end
 
-function GLD:ResumeCoverBlockers()
-  if not self.FindActiveRoll then
+local function ApplyCoverBlockerForFrame(self, rollID, rollFrame, mode)
+  if not rollID or not rollFrame then
+    return
+  end
+  if not (self.AreLootBlockersEnabled and self:AreLootBlockersEnabled()) then
+    return
+  end
+  self:ObserveLootRollFrame(rollFrame, "ReapplyCover", rollID, false)
+  self._rollFrameByRollID = self._rollFrameByRollID or {}
+  self._rollFrameByRollID[rollID] = rollFrame
+  rollFrame._gldBlockerNeedsOnShow = true
+  rollFrame._gldBlockerOnShowMode = mode
+  RollBlockers.SetMode(rollFrame, mode)
+  LBPrint(
+    "ApplyBlocker: source=ReapplyCover rollID="
+      .. tostring(rollID)
+      .. " mode="
+      .. tostring(mode)
+      .. " frame="
+      .. tostring(rollFrame.GetName and rollFrame:GetName() or rollFrame)
+  )
+  if C_Timer and C_Timer.After then
+    C_Timer.After(0, function()
+      if not (self.AreLootBlockersEnabled and self:AreLootBlockersEnabled()) then
+        return
+      end
+      RollBlockers.SetMode(rollFrame, mode)
+    end)
+  end
+end
+
+function GLD:ReapplyCoverBlockersForActiveRolls(reason, allowRetry)
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
+  if not self:AreLootBlockersEnabled() then
+    self._reapplyBlockersRetryPending = nil
+    return
+  end
+  if self.GetPugsInRaid and self:GetPugsInRaid() then
+    if self._rollFrameByRollID then
+      for rollID, rollFrame in pairs(self._rollFrameByRollID) do
+        if rollFrame then
+          RollBlockers.SetMode(rollFrame, "UNLOCK_ALL")
+        elseif self.ClearCoverOverridesForRoll then
+          self:ClearCoverOverridesForRoll(rollID)
+        end
+      end
+    end
+    self:RunLootBootBootstrap("ReapplyCoverBlockers:pugs_mode")
+    return
+  end
+  if not self.activeRolls then
     return
   end
   local playerGUID = UnitGUID("player")
   if not playerGUID then
     return
   end
-  local seen = {}
-  local function ApplyForFrame(rollID, rollFrame)
-    if not rollID or not rollFrame then
-      return
-    end
-    local _, session = self:FindActiveRoll(nil, rollID)
-    if not session or session.locked then
-      return
-    end
-    if self.IsRollSessionExpired and self:IsRollSessionExpired(session) then
-      return
-    end
-    self._rollFrameByRollID = self._rollFrameByRollID or {}
-    self._rollFrameByRollID[rollID] = rollFrame
-    local mode = GetResumeMode(self, rollID, playerGUID)
-    rollFrame._gldBlockerNeedsOnShow = true
-    rollFrame._gldBlockerOnShowMode = mode
-    RollBlockers.SetMode(rollFrame, mode)
-    if C_Timer and C_Timer.After then
-      C_Timer.After(0, function()
-        RollBlockers.SetMode(rollFrame, mode)
-      end)
-    end
-  end
-
-  if GroupLootContainer and GroupLootContainer.GetFrameForRollID and self.activeRolls then
-    for _, session in pairs(self.activeRolls) do
-      local rollID = session and session.rollID or nil
-      if rollID and not seen[rollID] then
-        local frame = GroupLootContainer:GetFrameForRollID(rollID)
-        if frame then
-          seen[rollID] = true
-          ApplyForFrame(rollID, frame)
+  local missing = false
+  for _, session in pairs(self.activeRolls) do
+    if session and not session.locked then
+      if not (self.IsRollSessionExpired and self:IsRollSessionExpired(session)) then
+        local rollID = session.rollID
+        local rollFrame = rollID and FindRollFrameByID(rollID) or nil
+        local mode = GetResumeMode(self, rollID, playerGUID)
+        local applied = false
+        if rollFrame then
+          ApplyCoverBlockerForFrame(self, rollID, rollFrame, mode)
+          applied = true
+        else
+          missing = true
+        end
+        if self.LilyDebug then
+          local sessionId = session.rollID or session.rollKey or "unknown"
+          local itemRef = session.itemLink or session.itemID or session.itemName or "unknown"
+          self:LilyDebug(
+            string.format(
+              "[VOTE] ReapplyBlockers session=%s item=%s blocked=%s",
+              tostring(sessionId),
+              tostring(itemRef),
+              tostring(applied)
+            )
+          )
         end
       end
     end
   end
-
-  local maxFrames = NUM_GROUP_LOOT_FRAMES or NUM_LOOT_ROLLS or 8
-  for i = 1, maxFrames do
-    local frame = _G["GroupLootFrame" .. i] or _G["LootRollFrame" .. i]
-    if frame and frame.IsShown and frame:IsShown() then
-      local rollID = frame.rollID or frame.lootID or frame.LootID
-      if rollID and not seen[rollID] then
-        seen[rollID] = true
-        ApplyForFrame(rollID, frame)
-      end
+  if missing and allowRetry and C_Timer and C_Timer.After then
+    if not self._reapplyBlockersRetryPending then
+      self._reapplyBlockersRetryPending = true
+      C_Timer.After(0.2, function()
+        if not (self.AreLootBlockersEnabled and self:AreLootBlockersEnabled()) then
+          self._reapplyBlockersRetryPending = nil
+          return
+        end
+        self._reapplyBlockersRetryPending = nil
+        self:ReapplyCoverBlockersForActiveRolls(reason, false)
+      end)
     end
   end
+  self:RunLootBootBootstrap("ReapplyCoverBlockers:" .. tostring(reason))
+end
+
+function GLD:ResumeCoverBlockers()
+  self:ReapplyCoverBlockersForActiveRolls("resume", true)
 end
 
 function GLD:OnCoverLogin()
+  if self.RefreshLootControllerFromPersistence then
+    self:RefreshLootControllerFromPersistence("PLAYER_LOGIN")
+  end
+  if self.IsEnabled and not self:IsEnabled() then
+    self:ClearLootRollInterception("PLAYER_LOGIN", true)
+    return
+  end
+  local state = self:EnsureLootBootState()
+  state.sawPlayerLogin = true
+  state.bootGuardArmed = self:IsLootRollBlockModeActive()
+  if not self:AreLootBlockersEnabled() then
+    self:ClearLootRollInterception("PLAYER_LOGIN", true)
+    return
+  end
+  LBPrint("PLAYER_LOGIN loot bootstrap")
+  self:RunLootBootBootstrap("PLAYER_LOGIN")
+  self:StartLootBootLateScan("PLAYER_LOGIN")
   if C_Timer and C_Timer.After then
     C_Timer.After(0, function()
-      self:ResumeCoverBlockers()
+      if self.ResumeCoverBlockers then
+        self:ResumeCoverBlockers()
+      end
+      self:RunLootBootBootstrap("PLAYER_LOGIN.resume")
+      if not (self.IsAuthority and self:IsAuthority()) and self.IsSessionActive and self:IsSessionActive() and self.RequestRollSessionSnapshot then
+        self:RequestRollSessionSnapshot(nil, nil)
+      end
     end)
   else
-    self:ResumeCoverBlockers()
+    if self.ResumeCoverBlockers then
+      self:ResumeCoverBlockers()
+    end
+    self:RunLootBootBootstrap("PLAYER_LOGIN.resume")
+    if not (self.IsAuthority and self:IsAuthority()) and self.IsSessionActive and self:IsSessionActive() and self.RequestRollSessionSnapshot then
+      self:RequestRollSessionSnapshot(nil, nil)
+    end
   end
 end
 
@@ -679,11 +1871,14 @@ function GLD:IsHostEligible(unit)
   if not unit or not UnitExists(unit) then
     return false
   end
-  local guildName, _, rankIndex = GetGuildInfo(unit)
-  if not guildName or rankIndex == nil then
-    return false
+  local fullName = self.GetUnitFullName and self:GetUnitFullName(unit) or UnitName(unit)
+  if self.IsAuthorityName and fullName then
+    return select(1, self:IsAuthorityName(fullName, { source = "Loot.IsHostEligible" })) == true
   end
-  return rankIndex <= 2
+  if self.IsUnitGuildOfficer then
+    return self:IsUnitGuildOfficer(unit) == true
+  end
+  return false
 end
 
 function GLD:IsCoverAuthority()
@@ -718,6 +1913,9 @@ function GLD:InitCoverAuthority()
 end
 
 function GLD:OnCoverAuthorityTick()
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
   local now = GetCoverNow()
   if self:IsCoverAuthority() then
     self:SendCoverAuthPing()
@@ -736,6 +1934,9 @@ function GLD:OnCoverAuthorityTick()
 end
 
 function GLD:EnableCoverFallback()
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
   if self.coverFallbackActive then
     return
   end
@@ -744,6 +1945,10 @@ function GLD:EnableCoverFallback()
 end
 
 function GLD:DisableCoverFallback()
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    self.coverFallbackActive = false
+    return
+  end
   if not self.coverFallbackActive then
     return
   end
@@ -761,6 +1966,9 @@ function GLD:NextCoverEpoch()
 end
 
 function GLD:SendCoverMessage(parts)
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
   if not C_ChatInfo or not C_ChatInfo.SendAddonMessage then
     return
   end
@@ -772,6 +1980,9 @@ function GLD:SendCoverMessage(parts)
 end
 
 function GLD:SendCoverAuthPing()
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
   if not self:IsCoverAuthority() then
     return
   end
@@ -788,6 +1999,9 @@ function GLD:SendCoverAuthPing()
 end
 
 function GLD:RunCoverElection()
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
   if not IsInRaid() then
     return
   end
@@ -834,6 +2048,9 @@ function GLD:GetBestCoverCandidate()
 end
 
 function GLD:ApplyCoverAuthority(epoch, authorityGUID, sender)
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
   local previousEpoch = tonumber(self.coverEpoch) or 0
   if epoch < previousEpoch then
     return
@@ -886,6 +2103,9 @@ function GLD:GetCoverOverrideMode(rollID, playerGUID)
 end
 
 function GLD:GetCoverAutoMode()
+  if self.GetPugsInRaid and self:GetPugsInRaid() then
+    return "UNLOCK_ALL"
+  end
   if self.coverFallbackActive then
     return "UNLOCK_ALL"
   end
@@ -893,6 +2113,9 @@ function GLD:GetCoverAutoMode()
 end
 
 function GLD:ApplyCoverStateForRoll(rollID)
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
   if not rollID then
     return
   end
@@ -913,6 +2136,9 @@ function GLD:ApplyCoverStateForRoll(rollID)
 end
 
 function GLD:ApplyCoverStatesForAllActiveRolls()
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
   if not self._rollFrameByRollID then
     return
   end
@@ -922,6 +2148,9 @@ function GLD:ApplyCoverStatesForAllActiveRolls()
 end
 
 function GLD:SetCoverOverride(rollID, playerGUID, mode, broadcast)
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
   if not rollID or not playerGUID then
     return
   end
@@ -960,6 +2189,9 @@ function GLD:ClearCoverOverridesForRoll(rollID)
   if self.coverAppliedModes then
     self.coverAppliedModes[rollID] = nil
   end
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
   local rollFrame = self._rollFrameByRollID and self._rollFrameByRollID[rollID] or FindRollFrameByID(rollID)
   if rollFrame then
     RollBlockers.SetMode(rollFrame, "UNLOCK_ALL")
@@ -981,6 +2213,9 @@ function GLD:IsCoverSenderEligible(sender)
 end
 
 function GLD:OnCoverAddonMessage(_, prefix, message, _, sender)
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
   if prefix ~= COVER_COMM_PREFIX then
     return
   end
@@ -1259,6 +2494,8 @@ function GLD:BuildRollSessionPayload(session, options)
   return {
     rollID = session.rollID,
     rollKey = session.rollKey,
+    status = self.GetRollStatus and self:GetRollStatus(session) or session.status or "ACTIVE",
+    locked = session.locked == true,
     rollTime = GetRollRemainingTimeMs(session),
     rollExpiresAt = session.rollExpiresAt,
     itemLink = session.itemLink,
@@ -1277,6 +2514,10 @@ function GLD:BuildRollSessionPayload(session, options)
     expectedVoterClasses = expectedClasses,
     createdAt = session.createdAt,
     votes = votes,
+    computedWinnerGuid = session.computedWinnerGuid,
+    approvedWinnerGuid = session.approvedWinnerGuid,
+    resolutionReason = session.resolutionReason,
+    computedResult = session.computedResult,
     restrictionSnapshot = restrictionSnapshot,
     authorityGUID = self:GetAuthorityGUID(),
     authorityName = self:GetAuthorityName(),
@@ -1286,6 +2527,9 @@ function GLD:BuildRollSessionPayload(session, options)
 end
 
 function GLD:BroadcastRollSession(session, options, target)
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
   if not session or session.isTest then
     return
   end
@@ -1310,6 +2554,9 @@ function GLD:BroadcastRollSession(session, options, target)
 end
 
 function GLD:ScheduleRollSessionResend(session)
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
   if not session or session.isTest then
     return
   end
@@ -1354,6 +2601,9 @@ function GLD:ScheduleRollSessionResend(session)
 end
 
 function GLD:BroadcastActiveRollsSnapshot(targets, options)
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
   if not self:IsAuthority() then
     return
   end
@@ -1368,13 +2618,18 @@ function GLD:BroadcastActiveRollsSnapshot(targets, options)
   end
   local snapshotOptions = options or {}
   for _, session in pairs(self.activeRolls) do
-    if session and not session.locked and not session.isTest then
+    local status = self.GetRollStatus and self:GetRollStatus(session) or (session and session.status) or "ACTIVE"
+    local include = session and not session.isTest and (status == "ACTIVE" or status == "PENDING_APPROVAL")
+    if include then
       self:BroadcastRollSession(session, { snapshot = true, reopen = snapshotOptions.reopen })
     end
   end
 end
 
 function GLD:ForcePendingVotesWindow()
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return false
+  end
   if not self:IsAuthority() then
     return false
   end
@@ -1391,7 +2646,7 @@ function GLD:ForcePendingVotesWindow()
   }
   self:SendCommMessageSafe(NS.MSG.FORCE_PENDING, payload, "RAID")
   if self.UI and self.UI.ShowPendingFrame then
-    self.UI:ShowPendingFrame()
+    self.UI:ShowPendingFrame({ onlyIfPending = true, trigger = "force", reopen = true })
   end
   self:TraceStep("Force pending votes window sent to raid.")
   return true
@@ -1450,7 +2705,16 @@ function GLD:BuildExpectedVoters()
     if not UnitExists(unit) or not UnitIsConnected(unit) then
       return
     end
-    local key = NS:GetPlayerKeyFromUnit(unit)
+    if self.IsTrackedRaidUnit and not self:IsTrackedRaidUnit(unit) then
+      return
+    end
+    local key = nil
+    if self.GetTrackedPlayerKeyForUnit then
+      key = self:GetTrackedPlayerKeyForUnit(unit)
+    end
+    if not key then
+      key = NS:GetPlayerKeyFromUnit(unit)
+    end
     if key and not seen[key] then
       table.insert(list, key)
       seen[key] = true
@@ -1723,6 +2987,12 @@ function GLD:GetRollCandidateKey(sender)
     return nil
   end
   if type(sender) == "string" and sender:find("^Player%-") then
+    if self.FindGuestPlayerKeyByIdentity then
+      local guestKey = self:FindGuestPlayerKeyByIdentity(sender, nil, nil)
+      if guestKey then
+        return guestKey
+      end
+    end
     return sender
   end
   local name, realm = NS:SplitNameRealm(sender)
@@ -1804,6 +3074,9 @@ end
 function GLD:BuildRollResultSummaryLine(result)
   if not result then
     return nil
+  end
+  if result.resolutionReason == "LOST" or result.rollStatus == "LOST" then
+    return "Item marked LOST/VOID by admin. Queue standings unchanged."
   end
   local winnerName = result.winnerName or "None"
   local winnerVote = result.winnerVote
@@ -2109,31 +3382,22 @@ function GLD:CaptureBlizzardRollData(session)
   return rollMap
 end
 
-function GLD:FinalizeRoll(session)
-  if not session or session.locked then
-    return
+local function BuildRollResultId(session, result)
+  local rollRef = (session and (session.rollKey or session.rollID)) or "unknown"
+  local reason = result and (result.resolutionReason or result.rollStatus or result.resolvedBy) or "NORMAL"
+  local winner = result and (result.approvedWinnerGuid or result.winnerKey) or nil
+  local resolvedAt = result and (result.resolvedAt or result.startedAt) or 0
+  return tostring(rollRef) .. ":" .. tostring(reason or "NORMAL") .. ":" .. tostring(winner or "none") .. ":" .. tostring(resolvedAt or 0)
+end
+
+local function BuildRollResult(self, session, winnerKey, opts)
+  opts = opts or {}
+  local provider = opts.provider or (session.isTest and TestProvider or LiveProvider)
+  local rollMap = opts.rollMap
+  if rollMap == nil and self.CaptureBlizzardRollData then
+    rollMap = self:CaptureBlizzardRollData(session)
   end
-  if not session.isTest and not self:IsAuthority() then
-    return
-  end
-  local rollMap = self:CaptureBlizzardRollData(session)
-  local winnerKey = self:ResolveRollWinner(session)
-  if self:IsDebugEnabled() then
-    local totalVotes = CountVotes(session.votes)
-    local expectedCount = session.expectedVoters and #session.expectedVoters or 0
-    self:Debug(
-      "Finalize roll: rollID="
-        .. tostring(session.rollID)
-        .. " votes="
-        .. tostring(totalVotes)
-        .. "/"
-        .. tostring(expectedCount)
-        .. " winnerKey="
-        .. tostring(winnerKey)
-    )
-  end
-  local provider = session.isTest and TestProvider or LiveProvider
-  if LootEngine and LootEngine.CommitAward then
+  if opts.commitAward and winnerKey and LootEngine and LootEngine.CommitAward then
     LootEngine:CommitAward(winnerKey, session, provider)
   end
 
@@ -2169,169 +3433,6 @@ function GLD:FinalizeRoll(session)
     winnerClassToken = tostring(winnerClassToken):upper()
   end
   local winnerIsGuest = winnerPlayer and self.IsGuestEntry and self:IsGuestEntry(winnerPlayer) or false
-  local winnerIsGuest = winnerPlayer and self.IsGuestEntry and self:IsGuestEntry(winnerPlayer) or false
-
-  local resolvedAt = GetServerTime()
-  local voteSnapshot, voteCounts = SnapshotVotes(session.votes, provider)
-  local voteDetails = SnapshotVoteDetails(session.voteDetails, provider)
-  if self:IsDebugEnabled() then
-    self:Debug(
-      "Finalize roll votes: rollID="
-        .. tostring(session.rollID)
-        .. " NEED="
-        .. tostring(voteCounts and voteCounts.NEED)
-        .. " GREED="
-        .. tostring(voteCounts and voteCounts.GREED)
-        .. " TRANSMOG="
-        .. tostring(voteCounts and voteCounts.TRANSMOG)
-        .. " PASS="
-        .. tostring(voteCounts and voteCounts.PASS)
-    )
-  end
-  local missingAtLock = BuildMissingAtLock(session.expectedVoters, voteSnapshot, provider)
-  local startedAt = session.createdAt or resolvedAt
-  local resolvedBy = session.resolvedBy or "NORMAL"
-  local result = {
-    rollID = session.rollID,
-    rollKey = session.rollKey,
-    itemLink = session.itemLink,
-    itemName = session.itemName,
-    winnerKey = winnerKey,
-    winnerName = winnerFull,
-    winnerShortName = winnerShortName,
-    winnerClassToken = winnerClassToken,
-    winnerIsGuest = winnerIsGuest,
-    votes = voteSnapshot,
-    voteCounts = voteCounts,
-    voteDetails = voteDetails,
-    missingAtLock = missingAtLock,
-    startedAt = startedAt,
-    resolvedAt = resolvedAt,
-    resolvedBy = resolvedBy,
-    winnerVote = winnerVote,
-    winningRoll = winnerRoll,
-    blizzNeedAllowed = session.blizzNeedAllowed,
-    blizzGreedAllowed = session.blizzGreedAllowed,
-    blizzTransmogAllowed = session.blizzTransmogAllowed,
-  }
-
-  self:LogItemWonAudit(session, winnerKey, winnerVote, provider)
-
-  local overrideId, instructionVote, instructionText = self:ResolveInstructionOverride(result)
-  if overrideId then
-    result.instructionOverride = overrideId
-    result.instructionVote = instructionVote
-    result.instructionText = instructionText
-  end
-
-  session.locked = true
-  session.result = result
-  if self:IsDebugEnabled() then
-    self:Debug("Result locked: rollID=" .. tostring(session.rollID) .. " winner=" .. tostring(winnerFull))
-  end
-
-  if not session.isTest then
-    self:RecordRollHistory(result)
-  end
-  if session.isTest then
-    self:RecordTestSessionLoot(result, session)
-  else
-    self:RecordSessionLoot(result, session)
-  end
-  if session.isTest and winnerKey and self.MoveTestPlayerToQueueBottom then
-    self:MoveTestPlayerToQueueBottom(winnerKey)
-    if NS.TestUI and NS.TestUI.RefreshTestPanel then
-      NS.TestUI:RefreshTestPanel()
-    end
-  end
-  if self:IsAuthority() and not session.isTest then
-    self:AnnounceRollResult(result)
-    if winnerKey then
-      self:ApplyWinnerMove(winnerKey, winnerVote)
-      self:BroadcastSnapshot()
-    end
-    if IsInRaid() then
-      self:SendCommMessageSafe(NS.MSG.ROLL_RESULT, result, "RAID")
-    end
-    if self:IsDebugEnabled() then
-      self:Debug("Result broadcast: rollID=" .. tostring(session.rollID))
-    end
-  end
-  local activeKey = session.rollKey
-  if not activeKey and self.FindActiveRoll then
-    activeKey = select(1, self:FindActiveRoll(nil, session.rollID))
-  end
-  if activeKey and self.activeRolls then
-    self.activeRolls[activeKey] = nil
-  end
-  if self.CleanupActiveRolls then
-    self:CleanupActiveRolls(1800)
-  end
-  if self:IsDebugEnabled() then
-    self:Debug(
-      "Roll resolved: rollID="
-        .. tostring(session.rollID)
-        .. " rollKey="
-        .. tostring(session.rollKey)
-        .. " active="
-        .. tostring(CountActiveRolls(self.activeRolls))
-    )
-  end
-  if self.UI and self.UI.RefreshLootWindow then
-    self.UI:RefreshLootWindow()
-  end
-end
-
-function GLD:ApplyAdminOverride(session, winnerKey)
-  if not session or session.locked then
-    return false
-  end
-  if not self:IsAuthority() then
-    return false
-  end
-
-  local overrideBy = self:GetAuthorityName() or self:GetUnitFullName("player") or UnitName("player") or "Unknown"
-  local isPass = not winnerKey or winnerKey == "" or winnerKey == "GLD_FORCE_PASS"
-  if isPass then
-    winnerKey = nil
-  end
-
-  local provider = session.isTest and TestProvider or LiveProvider
-  local winnerPlayer = winnerKey and provider and provider.GetPlayer and provider:GetPlayer(winnerKey) or nil
-  local winnerName = winnerPlayer and winnerPlayer.name or (winnerKey or "None")
-  local winnerFull = winnerName
-  if winnerPlayer and winnerPlayer.realm and winnerPlayer.realm ~= "" then
-    winnerFull = winnerPlayer.name .. "-" .. winnerPlayer.realm
-  end
-  if isPass then
-    winnerFull = "Unclaimed"
-  end
-  local winnerVote = session.votes and winnerKey and session.votes[winnerKey] or nil
-  local rollMap = self:CaptureBlizzardRollData(session)
-  local winnerRoll = rollMap and winnerKey and rollMap[winnerKey] or nil
-  if winnerRoll == nil and winnerKey and session.voteDetails and session.voteDetails[winnerKey] then
-    winnerRoll = session.voteDetails[winnerKey].roll
-  end
-  local winnerShortName = winnerName
-  if winnerFull and winnerFull ~= "" and NS and NS.SplitNameRealm then
-    local short = select(1, NS:SplitNameRealm(winnerFull))
-    if short and short ~= "" then
-      winnerShortName = short
-    end
-  end
-  if isPass then
-    winnerShortName = "Unclaimed"
-  end
-  local winnerClassToken = winnerPlayer
-    and (winnerPlayer.classToken or winnerPlayer.classFile or winnerPlayer.classFileName or winnerPlayer.class)
-    or nil
-  if winnerClassToken then
-    winnerClassToken = tostring(winnerClassToken):upper()
-  end
-
-  if winnerKey and LootEngine and LootEngine.CommitAward then
-    LootEngine:CommitAward(winnerKey, session, provider)
-  end
 
   local resolvedAt = GetServerTime()
   local voteSnapshot, voteCounts = SnapshotVotes(session.votes, provider)
@@ -2356,8 +3457,8 @@ function GLD:ApplyAdminOverride(session, winnerKey)
     missingAtLock = missingAtLock,
     startedAt = startedAt,
     resolvedAt = resolvedAt,
-    resolvedBy = "OVERRIDE",
-    overrideBy = overrideBy,
+    resolvedBy = opts.resolvedBy or session.resolvedBy or "NORMAL",
+    overrideBy = opts.overrideBy,
     authorityGUID = authorityGUID,
     authorityName = authorityName,
     winnerVote = winnerVote,
@@ -2365,30 +3466,55 @@ function GLD:ApplyAdminOverride(session, winnerKey)
     blizzNeedAllowed = session.blizzNeedAllowed,
     blizzGreedAllowed = session.blizzGreedAllowed,
     blizzTransmogAllowed = session.blizzTransmogAllowed,
+    rollStatus = opts.rollStatus,
+    computedWinnerGuid = opts.computedWinnerGuid,
+    approvedWinnerGuid = opts.approvedWinnerGuid,
+    resolutionReason = opts.resolutionReason,
+    approvedByGuid = opts.approvedByGuid,
+    approvedByName = opts.approvedByName,
+    markedByGuid = opts.markedByGuid,
+    markedByName = opts.markedByName,
   }
-
-  self:LogItemWonAudit(session, winnerKey, winnerVote, provider)
-
+  result.resultId = BuildRollResultId(session, result)
   local overrideId, instructionVote, instructionText = self:ResolveInstructionOverride(result)
   if overrideId then
     result.instructionOverride = overrideId
     result.instructionVote = instructionVote
     result.instructionText = instructionText
   end
+  return result, winnerVote, provider
+end
 
+local function RemoveActiveRoll(self, session)
+  local activeKey = session and session.rollKey
+  if not activeKey and self.FindActiveRoll then
+    activeKey = select(1, self:FindActiveRoll(nil, session and session.rollID))
+  end
+  if activeKey and self.activeRolls then
+    self.activeRolls[activeKey] = nil
+  end
+end
+
+function GLD:CommitResolvedRoll(session, result, opts)
+  opts = opts or {}
+  if not session or not result then
+    return false
+  end
+  if self.GetRollStatus and self:IsRollStatusTerminal(self:GetRollStatus(session)) then
+    return false
+  end
   session.locked = true
+  session.status = result.rollStatus or opts.sessionStatus or "CLOSED"
   session.result = result
-  if self:IsDebugEnabled() then
-    self:Debug(
-      "Override applied: rollID="
-        .. tostring(session.rollID)
-        .. " item="
-        .. tostring(session.itemLink or session.itemName or "Item")
-        .. " winner="
-        .. tostring(winnerFull)
-        .. " by="
-        .. tostring(overrideBy)
-    )
+  session.resolutionReason = result.resolutionReason or session.resolutionReason
+  session.approvedWinnerGuid = result.approvedWinnerGuid or session.approvedWinnerGuid
+  session.computedWinnerGuid = result.computedWinnerGuid or session.computedWinnerGuid
+
+  if result.winnerKey and self.ApplyCoverOutcomeForResult then
+    self:ApplyCoverOutcomeForResult(result)
+  end
+  if opts.logAudit ~= false then
+    self:LogItemWonAudit(session, result.winnerKey, result.winnerVote, opts.provider)
   end
 
   if not session.isTest then
@@ -2399,32 +3525,47 @@ function GLD:ApplyAdminOverride(session, winnerKey)
   else
     self:RecordSessionLoot(result, session)
   end
-  if session.isTest and winnerKey and self.MoveTestPlayerToQueueBottom then
-    self:MoveTestPlayerToQueueBottom(winnerKey)
+
+  if session.isTest and result.winnerKey and self.MoveTestPlayerToQueueBottom then
+    self:MoveTestPlayerToQueueBottom(result.winnerKey)
     if NS.TestUI and NS.TestUI.RefreshTestPanel then
       NS.TestUI:RefreshTestPanel()
     end
   end
-  if self:IsAuthority() and not session.isTest then
-    self:AnnounceRollResult(result)
-    if winnerKey then
-      self:ApplyWinnerMove(winnerKey, winnerVote)
+
+  if self:IsAuthority() and not session.isTest and opts.broadcast ~= false then
+    if opts.announce ~= false then
+      self:AnnounceRollResult(result)
+    end
+    if opts.applyWinnerMove ~= false and result.winnerKey then
+      self:ApplyWinnerMove(result.winnerKey, result.winnerVote)
       self:BroadcastSnapshot()
     end
     if IsInRaid() then
       self:SendCommMessageSafe(NS.MSG.ROLL_RESULT, result, "RAID")
+      if result.rollStatus == "APPROVED" and result.resolutionReason == "CONFIRMED_OBTAINED" and NS.MSG.ROLL_APPROVED then
+        self:SendCommMessageSafe(NS.MSG.ROLL_APPROVED, {
+          rollID = result.rollID,
+          rollKey = result.rollKey,
+          approvedWinnerGuid = result.approvedWinnerGuid or result.winnerKey,
+          approvedByGuid = result.approvedByGuid or UnitGUID("player"),
+          authorityGUID = self:GetAuthorityGUID(),
+          authorityName = self:GetAuthorityName(),
+        }, "RAID")
+      elseif result.rollStatus == "LOST" and NS.MSG.ROLL_LOST then
+        self:SendCommMessageSafe(NS.MSG.ROLL_LOST, {
+          rollID = result.rollID,
+          rollKey = result.rollKey,
+          markedByGuid = result.markedByGuid or UnitGUID("player"),
+          authorityGUID = self:GetAuthorityGUID(),
+          authorityName = self:GetAuthorityName(),
+        }, "RAID")
+      end
     end
-    if self:IsDebugEnabled() then
-      self:Debug("Override result broadcast: rollID=" .. tostring(session.rollID))
-    end
   end
-  local activeKey = session.rollKey
-  if not activeKey and self.FindActiveRoll then
-    activeKey = select(1, self:FindActiveRoll(nil, session.rollID))
-  end
-  if activeKey and self.activeRolls then
-    self.activeRolls[activeKey] = nil
-  end
+
+  RemoveActiveRoll(self, session)
+  session.status = "CLOSED"
   if self.CleanupActiveRolls then
     self:CleanupActiveRolls(1800)
   end
@@ -2434,6 +3575,8 @@ function GLD:ApplyAdminOverride(session, winnerKey)
         .. tostring(session.rollID)
         .. " rollKey="
         .. tostring(session.rollKey)
+        .. " reason="
+        .. tostring(result.resolutionReason or result.rollStatus or result.resolvedBy)
         .. " active="
         .. tostring(CountActiveRolls(self.activeRolls))
     )
@@ -2442,6 +3585,423 @@ function GLD:ApplyAdminOverride(session, winnerKey)
     self.UI:RefreshLootWindow()
   end
   return true
+end
+
+function GLD:SetRollPendingApproval(session, computedResult, winnerKey)
+  if not session or not computedResult then
+    return false
+  end
+  if self.GetRollStatus and self:GetRollStatus(session) ~= "ACTIVE" then
+    return false
+  end
+  session.locked = true
+  session.status = "PENDING_APPROVAL"
+  session.computedWinnerGuid = winnerKey
+  session.approvedWinnerGuid = nil
+  session.resolutionReason = "PENDING_APPROVAL"
+  session.computedResult = computedResult
+
+  if self.BroadcastRollSession then
+    self:BroadcastRollSession(session, { snapshot = true, reopen = true })
+  end
+  if self:IsAuthority() and IsInRaid() and NS.MSG.ROLL_PENDING_APPROVAL then
+    self:SendCommMessageSafe(NS.MSG.ROLL_PENDING_APPROVAL, {
+      rollID = session.rollID,
+      rollKey = session.rollKey,
+      itemLink = session.itemLink,
+      itemName = session.itemName,
+      status = "PENDING_APPROVAL",
+      computedWinnerGuid = winnerKey,
+      computedResult = computedResult,
+      votes = session.votes,
+      authorityGUID = self:GetAuthorityGUID(),
+      authorityName = self:GetAuthorityName(),
+    }, "RAID")
+  end
+  if self:IsDebugEnabled() then
+    self:Debug(
+      "Roll pending approval: rollID="
+        .. tostring(session.rollID)
+        .. " rollKey="
+        .. tostring(session.rollKey)
+        .. " computedWinner="
+        .. tostring(winnerKey)
+    )
+  end
+  if self.UI and self.UI.RefreshLootWindow then
+    self.UI:RefreshLootWindow({ forceShow = true, reopen = true, onlyIfPending = true, trigger = "force" })
+  end
+  return true
+end
+
+function GLD:IsTrackedAddonHolderRecipient(winnerKey, session)
+  if not winnerKey then
+    return false
+  end
+  local key = winnerKey
+  if self.GetRollCandidateKey then
+    key = self:GetRollCandidateKey(winnerKey) or winnerKey
+  end
+  local player = self.db and self.db.players and self.db.players[key] or nil
+  if player and self.IsGuestEntry and self:IsGuestEntry(player) then
+    return true
+  end
+  if player and player.source == "guild" then
+    return true
+  end
+  if IsInRaid() then
+    local ourGuild = self.GetOurGuildName and self:GetOurGuildName() or nil
+    for i = 1, GetNumGroupMembers() do
+      local unit = "raid" .. i
+      if UnitExists(unit) and UnitIsConnected(unit) then
+        local unitKey = NS:GetPlayerKeyFromUnit(unit)
+        if unitKey == key then
+          local guildName = GetGuildInfo(unit)
+          if ourGuild and guildName and guildName == ourGuild then
+            return true
+          end
+          break
+        end
+      end
+    end
+  end
+  return false
+end
+
+function GLD:ConfirmPendingRoll(rollRef, approvedWinnerGuid, opts)
+  opts = opts or {}
+  if not opts.skipPermission and self.CanAccessAdminUI and not self:CanAccessAdminUI() then
+    self:ShowPermissionDeniedPopup()
+    return false
+  end
+  if not self:IsAuthority() then
+    if self.RequestAdminAction then
+      return self:RequestAdminAction("ROLL_CONFIRM_OBTAINED", {
+        rollKey = rollRef,
+        approvedWinnerGuid = approvedWinnerGuid,
+      })
+    end
+    return false
+  end
+  local rollKey = nil
+  local rollID = nil
+  local session = nil
+  if type(rollRef) == "table" then
+    session = rollRef
+  elseif type(rollRef) == "number" then
+    rollID = rollRef
+  else
+    rollKey = rollRef
+  end
+  if not session and self.FindActiveRoll then
+    _, session = self:FindActiveRoll(rollKey, rollID)
+  end
+  if not session then
+    return false
+  end
+  if self.GetRollStatus and self:GetRollStatus(session) ~= "PENDING_APPROVAL" then
+    return false
+  end
+  local winnerKey = approvedWinnerGuid or session.computedWinnerGuid
+  if not winnerKey then
+    self:Print("Cannot confirm: no computed winner is available.")
+    return false
+  end
+  if self.GetRollCandidateKey then
+    winnerKey = self:GetRollCandidateKey(winnerKey) or winnerKey
+  end
+  if not self:IsTrackedAddonHolderRecipient(winnerKey, session) then
+    self:Print("Cannot confirm obtained: recipient is not a tracked guild/guest addon-holder.")
+    return false
+  end
+
+  local rollMap = self:CaptureBlizzardRollData(session)
+  local approvedByGuid = opts.actorGuid or UnitGUID("player")
+  local approvedByName = opts.actorName
+  if not approvedByName or approvedByName == "" then
+    approvedByName = self:GetAuthorityName() or self:GetUnitFullName("player") or UnitName("player") or "Unknown"
+  end
+  local result, _, provider = BuildRollResult(self, session, winnerKey, {
+    provider = session.isTest and TestProvider or LiveProvider,
+    rollMap = rollMap,
+    commitAward = true,
+    resolvedBy = "MANUAL_APPROVAL",
+    rollStatus = "APPROVED",
+    computedWinnerGuid = session.computedWinnerGuid or winnerKey,
+    approvedWinnerGuid = winnerKey,
+    resolutionReason = "CONFIRMED_OBTAINED",
+    approvedByGuid = approvedByGuid,
+    approvedByName = approvedByName,
+  })
+  session.approvedWinnerGuid = winnerKey
+  session.status = "APPROVED"
+  if self.LogAuditEvent and not session.isTest then
+    self:LogAuditEvent("ROLL_APPROVED", {
+      actor = approvedByName,
+      target = winnerKey,
+      details = tostring(session.rollKey or session.rollID) .. "|" .. tostring(session.itemLink or session.itemName or "Item"),
+    })
+  end
+  return self:CommitResolvedRoll(session, result, {
+    provider = provider,
+    announce = true,
+    applyWinnerMove = true,
+  })
+end
+
+function GLD:MarkPendingRollLost(rollRef, opts)
+  opts = opts or {}
+  if not opts.skipPermission and self.CanAccessAdminUI and not self:CanAccessAdminUI() then
+    self:ShowPermissionDeniedPopup()
+    return false
+  end
+  if not self:IsAuthority() then
+    if self.RequestAdminAction then
+      return self:RequestAdminAction("ROLL_MARK_LOST", {
+        rollKey = rollRef,
+      })
+    end
+    return false
+  end
+  local rollKey = nil
+  local rollID = nil
+  local session = nil
+  if type(rollRef) == "table" then
+    session = rollRef
+  elseif type(rollRef) == "number" then
+    rollID = rollRef
+  else
+    rollKey = rollRef
+  end
+  if not session and self.FindActiveRoll then
+    _, session = self:FindActiveRoll(rollKey, rollID)
+  end
+  if not session then
+    return false
+  end
+  if self.GetRollStatus and self:GetRollStatus(session) ~= "PENDING_APPROVAL" then
+    return false
+  end
+
+  local markedByGuid = opts.actorGuid or UnitGUID("player")
+  local markedByName = opts.actorName
+  if not markedByName or markedByName == "" then
+    markedByName = self:GetAuthorityName() or self:GetUnitFullName("player") or UnitName("player") or "Unknown"
+  end
+  local result, _, provider = BuildRollResult(self, session, nil, {
+    provider = session.isTest and TestProvider or LiveProvider,
+    commitAward = false,
+    resolvedBy = "MANUAL_APPROVAL",
+    rollStatus = "LOST",
+    computedWinnerGuid = session.computedWinnerGuid,
+    approvedWinnerGuid = nil,
+    resolutionReason = "LOST",
+    markedByGuid = markedByGuid,
+    markedByName = markedByName,
+  })
+  session.status = "LOST"
+  session.resolutionReason = "LOST"
+  if self.LogAuditEvent and not session.isTest then
+    self:LogAuditEvent("ROLL_LOST", {
+      actor = markedByName,
+      details = tostring(session.rollKey or session.rollID) .. "|" .. tostring(session.itemLink or session.itemName or "Item"),
+    })
+  end
+  return self:CommitResolvedRoll(session, result, {
+    provider = provider,
+    announce = false,
+    applyWinnerMove = false,
+  })
+end
+
+function GLD:FinalizeRoll(session)
+  if not session then
+    return
+  end
+  if self.GetRollStatus and self:GetRollStatus(session) ~= "ACTIVE" then
+    return
+  end
+  if session.locked then
+    return
+  end
+  if session and not session.isTest and ((self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive())) then
+    return
+  end
+  if not session.isTest and not self:IsAuthority() then
+    return
+  end
+
+  local rollMap = self:CaptureBlizzardRollData(session)
+  local winnerKey = self:ResolveRollWinner(session)
+  if self:IsDebugEnabled() then
+    local totalVotes = CountVotes(session.votes)
+    local expectedCount = session.expectedVoters and #session.expectedVoters or 0
+    self:Debug(
+      "Finalize roll: rollID="
+        .. tostring(session.rollID)
+        .. " votes="
+        .. tostring(totalVotes)
+        .. "/"
+        .. tostring(expectedCount)
+        .. " winnerKey="
+        .. tostring(winnerKey)
+        .. " pugsMode="
+        .. tostring(self.GetPugsInRaid and self:GetPugsInRaid())
+    )
+  end
+
+  if not session.isTest and self.GetPugsInRaid and self:GetPugsInRaid() then
+    local pendingResult = BuildRollResult(self, session, winnerKey, {
+      provider = session.isTest and TestProvider or LiveProvider,
+      rollMap = rollMap,
+      commitAward = false,
+      resolvedBy = "PENDING_APPROVAL",
+      rollStatus = "PENDING_APPROVAL",
+      computedWinnerGuid = winnerKey,
+      approvedWinnerGuid = nil,
+      resolutionReason = "PENDING_APPROVAL",
+    })
+    self:SetRollPendingApproval(session, pendingResult, winnerKey)
+    return
+  end
+
+  local result, _, provider = BuildRollResult(self, session, winnerKey, {
+    provider = session.isTest and TestProvider or LiveProvider,
+    rollMap = rollMap,
+    commitAward = true,
+    resolvedBy = session.resolvedBy or "NORMAL",
+    rollStatus = "APPROVED",
+    computedWinnerGuid = winnerKey,
+    approvedWinnerGuid = winnerKey,
+    resolutionReason = "AUTO_FINALIZED",
+  })
+  session.status = "APPROVED"
+  self:CommitResolvedRoll(session, result, {
+    provider = provider,
+    announce = true,
+    applyWinnerMove = true,
+  })
+end
+
+local function SplitOverrideWinnerIdentity(key)
+  if type(key) ~= "string" or key == "" then
+    return nil, nil, nil
+  end
+  if key:find("^Player%-") then
+    return key, nil, nil
+  end
+  if NS and NS.SplitNameRealm then
+    local name, realm = NS:SplitNameRealm(key)
+    if name and name ~= "" then
+      return nil, name, realm
+    end
+  end
+  return nil, key, nil
+end
+
+local function ResolveAdminOverrideWinnerKey(self, provider, winnerKey)
+  if not winnerKey then
+    return nil, nil
+  end
+  local resolved = winnerKey
+  if self.GetRollCandidateKey then
+    resolved = self:GetRollCandidateKey(resolved) or resolved
+  end
+  if provider and provider.GetPlayer and provider:GetPlayer(resolved) then
+    return resolved, nil
+  end
+  if not self.FindApprovedGuestEntry then
+    return resolved, nil
+  end
+
+  local guid, name, realm = SplitOverrideWinnerIdentity(resolved)
+  if not guid and not name then
+    guid, name, realm = SplitOverrideWinnerIdentity(winnerKey)
+  end
+  if provider and provider.GetPlayerName then
+    local providerName = provider:GetPlayerName(resolved)
+    if providerName and providerName ~= "" and providerName ~= resolved then
+      local _, providerBaseName, providerRealm = SplitOverrideWinnerIdentity(providerName)
+      if not name then
+        name = providerBaseName
+      end
+      if not realm then
+        realm = providerRealm
+      end
+    end
+  end
+  local guestEntry, guestKey = self:FindApprovedGuestEntry(guid, name, realm)
+  if guestKey and guestKey ~= "" then
+    return guestKey, guestEntry
+  end
+  return resolved, guestEntry
+end
+
+function GLD:ApplyAdminOverride(session, winnerKey)
+  if not session or session.locked then
+    return false
+  end
+  if session and not session.isTest and ((self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive())) then
+    return false
+  end
+  if not self:IsAuthority() then
+    return false
+  end
+  local isPass = not winnerKey or winnerKey == "" or winnerKey == "GLD_FORCE_PASS"
+  if isPass then
+    winnerKey = nil
+  end
+  local provider = session.isTest and TestProvider or LiveProvider
+  local guestEntry = nil
+  if winnerKey then
+    winnerKey, guestEntry = ResolveAdminOverrideWinnerKey(self, provider, winnerKey)
+  end
+  local overrideBy = self:GetAuthorityName() or self:GetUnitFullName("player") or UnitName("player") or "Unknown"
+  local rollMap = self:CaptureBlizzardRollData(session)
+  local result, _, resolvedProvider = BuildRollResult(self, session, winnerKey, {
+    provider = provider,
+    rollMap = rollMap,
+    commitAward = winnerKey ~= nil,
+    resolvedBy = "OVERRIDE",
+    overrideBy = overrideBy,
+    rollStatus = "APPROVED",
+    computedWinnerGuid = winnerKey,
+    approvedWinnerGuid = winnerKey,
+    resolutionReason = "OVERRIDE",
+    approvedByGuid = UnitGUID("player"),
+    approvedByName = overrideBy,
+  })
+  if result and winnerKey and guestEntry and (not result.winnerName or result.winnerName == winnerKey) then
+    local guestName = guestEntry.name
+    local guestRealm = guestEntry.realm
+    if guestName and guestName ~= "" then
+      result.winnerName = guestRealm and guestRealm ~= "" and (guestName .. "-" .. guestRealm) or guestName
+      result.winnerShortName = guestName
+      result.winnerIsGuest = true
+    end
+  end
+  session.status = "APPROVED"
+  if self:IsDebugEnabled() then
+    self:Debug(
+      "Override applied: rollID="
+        .. tostring(session.rollID)
+        .. " item="
+        .. tostring(session.itemLink or session.itemName or "Item")
+        .. " winner="
+        .. tostring(result.winnerName)
+        .. " winnerKey="
+        .. tostring(result.winnerKey)
+        .. " winnerVote="
+        .. tostring(result.winnerVote)
+        .. " by="
+        .. tostring(overrideBy)
+    )
+  end
+  return self:CommitResolvedRoll(session, result, {
+    provider = resolvedProvider,
+    announce = true,
+    applyWinnerMove = true,
+  })
 end
 
 function GLD:RecordTestSessionLoot(result, session)
@@ -2460,6 +4020,10 @@ function GLD:RecordTestSessionLoot(result, session)
     winnerKey = result.winnerKey,
     winnerName = result.winnerName,
     winnerIsGuest = result.winnerIsGuest,
+    rollStatus = result.rollStatus,
+    computedWinnerGuid = result.computedWinnerGuid,
+    approvedWinnerGuid = result.approvedWinnerGuid,
+    resolutionReason = result.resolutionReason,
     votes = result.votes,
     voteCounts = result.voteCounts,
     voteDetails = result.voteDetails,
@@ -2468,8 +4032,13 @@ function GLD:RecordTestSessionLoot(result, session)
     resolvedAt = result.resolvedAt or GetServerTime(),
     resolvedBy = result.resolvedBy or "NORMAL",
     overrideBy = result.overrideBy,
+    approvedByGuid = result.approvedByGuid,
+    approvedByName = result.approvedByName,
+    markedByGuid = result.markedByGuid,
+    markedByName = result.markedByName,
     winnerVote = result.winnerVote,
     winningRoll = result.winningRoll,
+    resultId = result.resultId,
     instructionOverride = result.instructionOverride,
     instructionVote = result.instructionVote,
     instructionText = result.instructionText,
@@ -2530,6 +4099,10 @@ function GLD:RecordSessionLoot(result, session)
     winnerKey = result.winnerKey,
     winnerName = result.winnerName,
     winnerIsGuest = result.winnerIsGuest,
+    rollStatus = result.rollStatus,
+    computedWinnerGuid = result.computedWinnerGuid,
+    approvedWinnerGuid = result.approvedWinnerGuid,
+    resolutionReason = result.resolutionReason,
     votes = result.votes,
     voteCounts = result.voteCounts,
     voteDetails = result.voteDetails,
@@ -2538,8 +4111,13 @@ function GLD:RecordSessionLoot(result, session)
     resolvedAt = result.resolvedAt or GetServerTime(),
     resolvedBy = result.resolvedBy or "NORMAL",
     overrideBy = result.overrideBy,
+    approvedByGuid = result.approvedByGuid,
+    approvedByName = result.approvedByName,
+    markedByGuid = result.markedByGuid,
+    markedByName = result.markedByName,
     winnerVote = result.winnerVote,
     winningRoll = result.winningRoll,
+    resultId = result.resultId,
     instructionOverride = result.instructionOverride,
     instructionVote = result.instructionVote,
     instructionText = result.instructionText,
@@ -2565,6 +4143,9 @@ function GLD:RecordSessionLoot(result, session)
       end
     end
   end
+  if self.TouchRaidSession then
+    self:TouchRaidSession(raidSession, "loot")
+  end
   if self.UI and self.UI.RefreshHistoryIfOpen then
     self.UI:RefreshHistoryIfOpen()
   end
@@ -2572,6 +4153,9 @@ end
 
 function GLD:CheckRollCompletion(session)
   if not session or session.locked then
+    return
+  end
+  if self.GetRollStatus and self:GetRollStatus(session) ~= "ACTIVE" then
     return
   end
   local expected = session.expectedVoters or {}
@@ -2620,15 +4204,26 @@ function GLD:OnStartLootRoll(event, rollID, rollTime, lootHandle)
     end
     return
   end
-  if self.LockLootRollButtons then
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    if debugEnabled then
+      self:Debug(
+        "Ignoring START_LOOT_ROLL (loot gate disabled): enabled="
+          .. tostring(self.IsEnabled and self:IsEnabled() or false)
+          .. " sessionActive="
+          .. tostring(self.IsSessionActive and self:IsSessionActive() or false)
+      )
+    end
+    return
+  end
+  if not (self.GetPugsInRaid and self:GetPugsInRaid()) and self.LockLootRollButtons then
     self:LockLootRollButtons(rollID)
   end
   if self.ApplyCoverStateForRoll then
     self:ApplyCoverStateForRoll(rollID)
   end
-  if not IsInRaid() or not self.db or not self.db.session or not self.db.session.active then
+  if not IsInRaid() then
     if debugEnabled then
-      self:Debug("Ignoring START_LOOT_ROLL (not in active raid session): inRaid=" .. tostring(IsInRaid()) .. " hasDB=" .. tostring(self.db ~= nil) .. " sessionActive=" .. tostring(self.db and self.db.session and self.db.session.active))
+      self:Debug("Ignoring START_LOOT_ROLL (not in raid): inRaid=" .. tostring(IsInRaid()))
     end
     return
   end
@@ -2684,6 +4279,7 @@ function GLD:OnStartLootRoll(event, rollID, rollTime, lootHandle)
   local session = {
     rollID = rollID,
     rollKey = rollKey,
+    status = "ACTIVE",
     rollTime = rollTimeMs,
     rollExpiresAt = rollExpiresAt,
     itemLink = link,
@@ -2737,7 +4333,7 @@ function GLD:OnStartLootRoll(event, rollID, rollTime, lootHandle)
   session.timerStarted = true
   C_Timer.After(delay, function()
     local active = self.activeRolls and rollKey and self.activeRolls[rollKey] or nil
-    if active and not active.locked then
+    if active and not active.locked and (not self.GetRollStatus or self:GetRollStatus(active) == "ACTIVE") then
       self:FinalizeRoll(active)
     end
   end)

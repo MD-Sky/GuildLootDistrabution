@@ -2,9 +2,9 @@
 ## Title: GuildLootDistribution
 ## Notes: Guild loot queue and distribution manager
 ## Author: GuildLoot
-## Version: 0.2.2
-## SavedVariables: GuildLootDB, GuildLootTestDB, GLT_DB
-## SavedVariablesPerCharacter: GuildLootShadow
+## Version: 0.2.3
+## SavedVariables: GuildLootAccountDB, GuildLootDB, GuildLootTestDB, GLT_DB
+## SavedVariablesPerCharacter: GuildLootCharDB
 ## OptionalDeps: Ace3
 
 Libs\Ace3\LibStub\LibStub.lua
@@ -21,9 +21,11 @@ Libs\Ace3\AceConfig-3.0\AceConfig-3.0.lua
 Libs\Ace3\AceConfig-3.0\AceConfigDialog-3.0\AceConfigDialog-3.0.lua
 
 Core.lua
+Debug.lua
+DB.lua
+AuthorityManager.lua
 Utils.lua
 ClassData.lua
-DB.lua
 TestDB.lua
 Authority.lua
 Queue.lua

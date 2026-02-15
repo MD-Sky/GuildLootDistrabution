@@ -12,7 +12,8 @@ function GLD:UpdateMinimapButtonPosition()
   if not self.minimapButton or not Minimap then
     return
   end
-  local config = self.db and self.db.config and self.db.config.minimap or nil
+  local ui = self.GetUIConfig and self:GetUIConfig() or nil
+  local config = ui and ui.minimap or nil
   if not config then
     return
   end
@@ -85,16 +86,19 @@ function GLD:InitMinimapButton()
   if not Minimap then
     return
   end
-  if not self.db or not self.db.config then
+  local ui = self.GetUIConfig and self:GetUIConfig() or nil
+  if not ui then
     return
   end
-
-  self.db.config.minimap = self.db.config.minimap or { hide = false, angle = 220 }
+  ui.minimap = ui.minimap or { hide = false, angle = 220 }
+  local config = ui.minimap
 
   if self.minimapButton then
     self:UpdateMinimapButtonPosition()
-    if self.db.config.minimap.hide then
+    if config.hide then
       self.minimapButton:Hide()
+    else
+      self.minimapButton:Show()
     end
     return
   end
@@ -141,7 +145,7 @@ function GLD:InitMinimapButton()
       if angle < 0 then
         angle = angle + 360
       end
-      self.db.config.minimap.angle = angle
+      config.angle = angle
       self:UpdateMinimapButtonPosition()
     end)
   end)
@@ -152,7 +156,7 @@ function GLD:InitMinimapButton()
 
   self.minimapButton = button
   self:UpdateMinimapButtonPosition()
-  if self.db.config.minimap.hide then
+  if config.hide then
     button:Hide()
   end
 end

@@ -114,6 +114,9 @@ function GLD:QueueInspect(unit)
   if InCombatLockdown and InCombatLockdown() then
     return
   end
+  if not self.inspectQueue then
+    self.inspectQueue = {}
+  end
   local key = GetUnitKey(unit)
   if not key then
     return
@@ -128,7 +131,7 @@ end
 
 function GLD:ProcessInspectQueue()
   if not self.inspectQueue then
-    return
+    self.inspectQueue = {}
   end
   for key, unit in pairs(self.inspectQueue) do
     if unit and UnitExists(unit) and CanInspect(unit) then

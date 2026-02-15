@@ -41,6 +41,7 @@ local ADMIN_COLUMN_PADDING = 4
 local ADMIN_SECTION_PADDING = 6
 local ADMIN_BUTTON_HEIGHT = 20
 local ADMIN_SCROLLBAR_OFFSET = 24
+local ADMIN_PREVIEW_MODE_POPUP_KEY = "GLD_ADMIN_PREVIEW_MODE_CHOICE"
 
 local ADMIN_HEADER_BACKDROP = {
   bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
@@ -102,6 +103,62 @@ local function AddSpecialFrame(name)
     end
   end
   table.insert(UISpecialFrames, name)
+end
+
+local function EnsureAdminPreviewModePopup()
+  if not StaticPopupDialogs or StaticPopupDialogs[ADMIN_PREVIEW_MODE_POPUP_KEY] then
+    return
+  end
+  StaticPopupDialogs[ADMIN_PREVIEW_MODE_POPUP_KEY] = {
+    text = "|cffffd200Admin Preview Mode|r\nPug mode?",
+    button1 = "Yes (Pug Mode)",
+    button2 = "No (Guild Mode)",
+    button3 = CANCEL,
+    OnAccept = function(_, data)
+      local callback = data and data.onChoice
+      if type(callback) == "function" then
+        callback(true)
+      end
+    end,
+    OnCancel = function(_, data, reason)
+      if reason ~= "clicked" then
+        return
+      end
+      local callback = data and data.onChoice
+      if type(callback) == "function" then
+        callback(false)
+      end
+    end,
+    OnAlt = function()
+      -- Cancel button: no-op.
+    end,
+    timeout = 0,
+    whileDead = true,
+    hideOnEscape = true,
+    preferredIndex = 3,
+  }
+end
+
+function TestUI:PromptPugModeChoice(onChoice)
+  if type(onChoice) ~= "function" then
+    return
+  end
+  EnsureAdminPreviewModePopup()
+  StaticPopup_Show(ADMIN_PREVIEW_MODE_POPUP_KEY, nil, nil, {
+    onChoice = function(choice)
+      local ok, err = pcall(onChoice, choice)
+      if not ok and GLD and GLD.Print then
+        GLD:Print("Failed to open admin preview: " .. tostring(err))
+      end
+    end,
+  })
+end
+
+GLD.AdminTest = GLD.AdminTest or {}
+function GLD.AdminTest:PromptPugModeChoice(onChoice)
+  if NS and NS.TestUI and NS.TestUI.PromptPugModeChoice then
+    NS.TestUI:PromptPugModeChoice(onChoice)
+  end
 end
 
 local function CopyColumnDefs(columns)
@@ -938,6 +995,89 @@ function GLD:InitTestUI()
   TestUI.testGraphsDebug = false
 end
 
+function TestUI:RefreshGuestSimStatus()
+  if not self.simGuestStatusLabel then
+    return
+  end
+  local count = 0
+  if GLD.GetSimGuestAnchors then
+    local list = GLD:GetSimGuestAnchors()
+    count = type(list) == "table" and #list or 0
+  end
+  local mode = GLD.GetSimMode and GLD:GetSimMode() or "merge"
+  local modeLabel = mode == "replace" and "Replace" or "Merge"
+  self.simGuestStatusLabel:SetText(string.format("Sim Guests: %d | Mode: %s", count, modeLabel))
+  if self.simModeToggleButton then
+    self.simModeToggleButton:SetText("Toggle Sim Mode: " .. modeLabel)
+  end
+end
+
+function TestUI:AddSimulatedGuest(isAdminLike)
+  if not GLD.AddSimGuestAnchor then
+    return
+  end
+  GLD:AddSimGuestAnchor({
+    isAdmin = isAdminLike == true,
+    showingButton = true,
+    classFile = isAdminLike and "PALADIN" or "MAGE",
+  })
+  if GLD.RefreshGuestAnchors then
+    GLD:RefreshGuestAnchors("SimGuestAdded")
+  end
+  local count = 0
+  if GLD.GetGuestAnchorCandidates then
+    local rows = GLD:GetGuestAnchorCandidates()
+    count = type(rows) == "table" and #rows or 0
+  end
+  local dbg = NS and NS.Debug or nil
+  if dbg and dbg.Force then
+    dbg:Force("GuestAnchorsUI", "Refresh reason=SimGuestAdded count=%d", count)
+  end
+  self:RefreshGuestSimStatus()
+end
+
+function TestUI:ClearSimulatedGuests()
+  if not GLD.ClearSimGuestAnchors then
+    return
+  end
+  GLD:ClearSimGuestAnchors()
+  if GLD.RefreshGuestAnchors then
+    GLD:RefreshGuestAnchors("SimGuestCleared")
+  end
+  local count = 0
+  if GLD.GetGuestAnchorCandidates then
+    local rows = GLD:GetGuestAnchorCandidates()
+    count = type(rows) == "table" and #rows or 0
+  end
+  local dbg = NS and NS.Debug or nil
+  if dbg and dbg.Force then
+    dbg:Force("GuestAnchorsUI", "Refresh reason=SimGuestCleared count=%d", count)
+  end
+  self:RefreshGuestSimStatus()
+end
+
+function TestUI:ToggleSimGuestMode()
+  if not GLD.GetSimMode or not GLD.SetSimMode then
+    return
+  end
+  local current = GLD:GetSimMode()
+  local nextMode = current == "replace" and "merge" or "replace"
+  GLD:SetSimMode(nextMode)
+  if GLD.RefreshGuestAnchors then
+    GLD:RefreshGuestAnchors("SimGuestModeChanged")
+  end
+  local count = 0
+  if GLD.GetGuestAnchorCandidates then
+    local rows = GLD:GetGuestAnchorCandidates()
+    count = type(rows) == "table" and #rows or 0
+  end
+  local dbg = NS and NS.Debug or nil
+  if dbg and dbg.Force then
+    dbg:Force("GuestAnchorsUI", "Refresh reason=SimGuestModeChanged count=%d", count)
+  end
+  self:RefreshGuestSimStatus()
+end
+
 function TestUI:StartTestSession()
   if self.testSessionActive then
     return
@@ -1438,30 +1578,79 @@ function TestUI:CreateTestFrame()
   local sessionBar = CreateFrame("Frame", nil, adminPanel, "InsetFrameTemplate3")
   sessionBar:SetPoint("TOPLEFT", adminPanel, "TOPLEFT", 0, 0)
   sessionBar:SetPoint("TOPRIGHT", adminPanel, "TOPRIGHT", 0, 0)
-  sessionBar:SetHeight(42)
+  sessionBar:SetHeight(90)
 
   local sessionTitle = sessionBar:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
   sessionTitle:SetPoint("TOPLEFT", sessionBar, "TOPLEFT", 8, -6)
   sessionTitle:SetText("Session Controls")
 
   local sessionStatus = sessionBar:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-  sessionStatus:SetPoint("RIGHT", sessionBar, "RIGHT", -10, 0)
+  sessionStatus:SetPoint("TOPRIGHT", sessionBar, "TOPRIGHT", -10, -6)
   sessionStatus:SetJustifyH("RIGHT")
-  sessionStatus:SetWidth(240)
+  sessionStatus:SetWidth(250)
   sessionStatus:SetText("Session Status: INACTIVE")
 
-  local buttonRow = CreateFrame("Frame", nil, sessionBar)
-  buttonRow:SetPoint("BOTTOMLEFT", sessionBar, "BOTTOMLEFT", 8, 6)
-  buttonRow:SetPoint("RIGHT", sessionStatus, "LEFT", -8, 0)
-  buttonRow:SetHeight(ADMIN_BUTTON_HEIGHT)
-
+  local buttonRow = nil
   local function CreateSessionButton(label, width, onClick)
+    if not buttonRow then
+      return nil
+    end
     local button = CreateFrame("Button", nil, buttonRow, "UIPanelButtonTemplate")
     button:SetSize(width, ADMIN_BUTTON_HEIGHT)
     button:SetText(label)
     button:SetScript("OnClick", onClick)
     return button
   end
+
+  local demoLootButton = CreateFrame("Button", nil, sessionBar, "UIPanelButtonTemplate")
+  demoLootButton:SetSize(220, ADMIN_BUTTON_HEIGHT)
+  demoLootButton:SetText("Show Example Loot/Pending Window")
+  demoLootButton:SetPoint("TOPRIGHT", sessionBar, "TOPRIGHT", -10, -22)
+  demoLootButton:SetScript("OnClick", function()
+    if GLD and GLD.ShowExampleMemberLootPendingWindow then
+      GLD:ShowExampleMemberLootPendingWindow()
+    elseif GLD.UI and GLD.UI.ShowLootWindowDemo then
+      GLD.UI:ShowLootWindowDemo("member")
+    end
+  end)
+
+  local demoAdminLootButton = CreateFrame("Button", nil, sessionBar, "UIPanelButtonTemplate")
+  demoAdminLootButton:SetSize(280, ADMIN_BUTTON_HEIGHT)
+  demoAdminLootButton:SetText("Show Example ADMIN Loot/Pending Window")
+  demoAdminLootButton:SetPoint("RIGHT", demoLootButton, "LEFT", -6, 0)
+  demoAdminLootButton:SetScript("OnClick", function()
+    if GLD and GLD.AdminTest and GLD.AdminTest.PromptPugModeChoice then
+      GLD.AdminTest:PromptPugModeChoice(function(pugMode)
+        if GLD and GLD.ShowExampleLootPendingWindow then
+          GLD:ShowExampleLootPendingWindow("admin", pugMode)
+        elseif GLD.UI and GLD.UI.ShowLootWindowDemo then
+          GLD.UI:ShowLootWindowDemo("admin", { pugMode = pugMode == true })
+        end
+      end)
+    elseif GLD and GLD.ShowExampleLootPendingWindow then
+      GLD:ShowExampleLootPendingWindow("admin", false)
+    elseif GLD.UI and GLD.UI.ShowLootWindowDemo then
+      GLD.UI:ShowLootWindowDemo("admin", { pugMode = false })
+    end
+  end)
+  demoAdminLootButton:SetScript("OnEnter", function(selfButton)
+    GameTooltip:SetOwner(selfButton, "ANCHOR_RIGHT")
+    GameTooltip:SetText("Preview admin controls (force vote/pending, confirm obtained) - test only", 1, 0.82, 0, 1, true)
+    GameTooltip:Show()
+  end)
+  demoAdminLootButton:SetScript("OnLeave", function()
+    GameTooltip:Hide()
+  end)
+
+  if not GLD:IsAdmin() then
+    demoLootButton:Hide()
+    demoAdminLootButton:Hide()
+  end
+
+  buttonRow = CreateFrame("Frame", nil, sessionBar)
+  buttonRow:SetPoint("TOPLEFT", sessionBar, "TOPLEFT", 8, -22)
+  buttonRow:SetPoint("RIGHT", demoAdminLootButton, "LEFT", -8, 0)
+  buttonRow:SetHeight(ADMIN_BUTTON_HEIGHT)
 
   local sessionButtons = {}
   sessionButtons[#sessionButtons + 1] = CreateSessionButton("Start Session", 110, function()
@@ -1504,18 +1693,52 @@ function TestUI:CreateTestFrame()
     previous = button
   end
 
-  local demoLootButton = CreateFrame("Button", nil, sessionBar, "UIPanelButtonTemplate")
-  demoLootButton:SetSize(220, ADMIN_BUTTON_HEIGHT)
-  demoLootButton:SetText("Show Example Loot/Pending Window")
-  demoLootButton:SetPoint("BOTTOMRIGHT", sessionBar, "BOTTOMRIGHT", -10, 6)
-  demoLootButton:SetScript("OnClick", function()
-    if GLD.UI and GLD.UI.ShowLootWindowDemo then
-      GLD.UI:ShowLootWindowDemo()
-    end
+  local simSectionTitle = sessionBar:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+  simSectionTitle:SetPoint("TOPLEFT", buttonRow, "BOTTOMLEFT", 0, -8)
+  simSectionTitle:SetText("Guest Anchor Simulation")
+
+  local simGuestStatusLabel = sessionBar:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+  simGuestStatusLabel:SetPoint("LEFT", simSectionTitle, "RIGHT", 10, 0)
+  simGuestStatusLabel:SetPoint("RIGHT", sessionBar, "RIGHT", -10, 0)
+  simGuestStatusLabel:SetJustifyH("RIGHT")
+  simGuestStatusLabel:SetText("Sim Guests: 0 | Mode: Merge")
+
+  local simButtonRow = CreateFrame("Frame", nil, sessionBar)
+  simButtonRow:SetPoint("TOPLEFT", simSectionTitle, "BOTTOMLEFT", 0, -4)
+  simButtonRow:SetPoint("RIGHT", sessionBar, "RIGHT", -10, 0)
+  simButtonRow:SetHeight(ADMIN_BUTTON_HEIGHT)
+
+  local simAddBtn = CreateFrame("Button", nil, simButtonRow, "UIPanelButtonTemplate")
+  simAddBtn:SetSize(145, ADMIN_BUTTON_HEIGHT)
+  simAddBtn:SetPoint("LEFT", simButtonRow, "LEFT", 0, 0)
+  simAddBtn:SetText("Add Simulated Guest")
+  simAddBtn:SetScript("OnClick", function()
+    TestUI:AddSimulatedGuest(false)
   end)
-  if not GLD:IsAdmin() then
-    demoLootButton:Hide()
-  end
+
+  local simAddAdminBtn = CreateFrame("Button", nil, simButtonRow, "UIPanelButtonTemplate")
+  simAddAdminBtn:SetSize(190, ADMIN_BUTTON_HEIGHT)
+  simAddAdminBtn:SetPoint("LEFT", simAddBtn, "RIGHT", 6, 0)
+  simAddAdminBtn:SetText("Add Sim Guest (Admin-like)")
+  simAddAdminBtn:SetScript("OnClick", function()
+    TestUI:AddSimulatedGuest(true)
+  end)
+
+  local simClearBtn = CreateFrame("Button", nil, simButtonRow, "UIPanelButtonTemplate")
+  simClearBtn:SetSize(150, ADMIN_BUTTON_HEIGHT)
+  simClearBtn:SetPoint("LEFT", simAddAdminBtn, "RIGHT", 6, 0)
+  simClearBtn:SetText("Clear Simulated Guests")
+  simClearBtn:SetScript("OnClick", function()
+    TestUI:ClearSimulatedGuests()
+  end)
+
+  local simModeBtn = CreateFrame("Button", nil, simButtonRow, "UIPanelButtonTemplate")
+  simModeBtn:SetSize(165, ADMIN_BUTTON_HEIGHT)
+  simModeBtn:SetPoint("LEFT", simClearBtn, "RIGHT", 6, 0)
+  simModeBtn:SetText("Toggle Sim Mode: Merge")
+  simModeBtn:SetScript("OnClick", function()
+    TestUI:ToggleSimGuestMode()
+  end)
 
   local playerPanel = CreateFrame("Frame", nil, adminPanel, "InsetFrameTemplate3")
   playerPanel:SetPoint("TOPLEFT", sessionBar, "BOTTOMLEFT", 0, -ADMIN_SECTION_PADDING)
@@ -1599,6 +1822,18 @@ function TestUI:CreateTestFrame()
     TestUI:InitializePlayerRow(row)
     TestUI:PopulatePlayerRow(row, elementData)
   end)
+  if playerView.SetElementResetter then
+    playerView:SetElementResetter(function(row)
+      if not row then
+        return
+      end
+      row.data = nil
+      row.canRemoveHoverHighlight = false
+      if row.SetRemoveHoverHighlighted then
+        row:SetRemoveHoverHighlighted(false)
+      end
+    end)
+  end
   playerView:SetElementExtent(ADMIN_ROW_HEIGHT)
   ScrollUtil.InitScrollBoxListWithScrollBar(playerScrollBox, playerScrollBar, playerView)
 
@@ -1984,11 +2219,44 @@ function TestUI:CreateTestFrame()
   pendingBtn.frame:ClearAllPoints()
   pendingBtn.frame:SetPoint("TOPLEFT", dropBothBtn.frame, "BOTTOMLEFT", 0, -10)
   pendingBtn:SetCallback("OnClick", function()
-    if GLD.UI and GLD.UI.ShowLootWindowDemo then
-      GLD.UI:ShowLootWindowDemo()
+    if GLD and GLD.ShowExampleMemberLootPendingWindow then
+      GLD:ShowExampleMemberLootPendingWindow()
+    elseif GLD.UI and GLD.UI.ShowLootWindowDemo then
+      GLD.UI:ShowLootWindowDemo("member")
     end
   end)
   pendingBtn.frame:SetShown(GLD:IsAdmin())
+
+  local pendingAdminBtn = AceGUI:Create("Button")
+  pendingAdminBtn:SetText("Show Example ADMIN Loot/Pending Window")
+  pendingAdminBtn:SetWidth(300)
+  pendingAdminBtn.frame:SetParent(lootControls)
+  pendingAdminBtn.frame:ClearAllPoints()
+  pendingAdminBtn.frame:SetPoint("TOPLEFT", pendingBtn.frame, "BOTTOMLEFT", 0, -6)
+  pendingAdminBtn:SetCallback("OnClick", function()
+    if GLD and GLD.AdminTest and GLD.AdminTest.PromptPugModeChoice then
+      GLD.AdminTest:PromptPugModeChoice(function(pugMode)
+        if GLD and GLD.ShowExampleLootPendingWindow then
+          GLD:ShowExampleLootPendingWindow("admin", pugMode)
+        elseif GLD.UI and GLD.UI.ShowLootWindowDemo then
+          GLD.UI:ShowLootWindowDemo("admin", { pugMode = pugMode == true })
+        end
+      end)
+    elseif GLD and GLD.ShowExampleLootPendingWindow then
+      GLD:ShowExampleLootPendingWindow("admin", false)
+    elseif GLD.UI and GLD.UI.ShowLootWindowDemo then
+      GLD.UI:ShowLootWindowDemo("admin", { pugMode = false })
+    end
+  end)
+  pendingAdminBtn.frame:SetShown(GLD:IsAdmin())
+  pendingAdminBtn.frame:SetScript("OnEnter", function(selfButton)
+    GameTooltip:SetOwner(selfButton, "ANCHOR_RIGHT")
+    GameTooltip:SetText("Preview admin controls (force vote/pending, confirm obtained) - test only", 1, 0.82, 0, 1, true)
+    GameTooltip:Show()
+  end)
+  pendingAdminBtn.frame:SetScript("OnLeave", function()
+    GameTooltip:Hide()
+  end)
 
   local lootListPanel = CreateFrame("Frame", nil, lootPanel, "InsetFrameTemplate3")
   lootListPanel:SetPoint("TOPLEFT", lootControls, "BOTTOMLEFT", 0, -ADMIN_SECTION_PADDING)
@@ -2027,6 +2295,8 @@ function TestUI:CreateTestFrame()
   self.dataTabButton = dataTabButton
   self.historyTabButton = historyTabButton
   self.sessionStatus = sessionStatus
+  self.simGuestStatusLabel = simGuestStatusLabel
+  self.simModeToggleButton = simModeBtn
   self.playerHeaderRow = playerHeaderRow
   self.playerScrollBox = playerScrollBox
   self.playerScrollBar = playerScrollBar
@@ -2081,6 +2351,7 @@ function TestUI:CreateTestFrame()
   self:UpdateSelectedItemInfo()
 
   self:SetActiveAdminTab("admin")
+  self:RefreshGuestSimStatus()
   frame:Hide()
 end
 
@@ -2096,6 +2367,21 @@ function TestUI:InitializePlayerRow(row)
   local highlight = row:CreateTexture(nil, "HIGHLIGHT")
   highlight:SetColorTexture(1, 1, 1, 0.08)
   highlight:SetAllPoints(row)
+  row.baseHighlight = highlight
+
+  local removeHoverHighlight = row:CreateTexture(nil, "BACKGROUND")
+  removeHoverHighlight:SetAllPoints(row)
+  removeHoverHighlight:SetColorTexture(0.95, 0.25, 0.25, 0.16)
+  removeHoverHighlight:Hide()
+  row.removeHoverHighlight = removeHoverHighlight
+  row.canRemoveHoverHighlight = false
+  function row:SetRemoveHoverHighlighted(highlighted)
+    if not self.removeHoverHighlight then
+      return
+    end
+    local show = highlighted == true and self.canRemoveHoverHighlight == true
+    self.removeHoverHighlight:SetShown(show)
+  end
 
   row.cells = {}
   for _, col in ipairs(self.playerColumns or {}) do
@@ -2229,6 +2515,14 @@ function TestUI:InitializePlayerRow(row)
         GLD.UI:RefreshMain()
       end
     end)
+    row.cells.remove:HookScript("OnEnter", function()
+      if row.canRemoveHoverHighlight then
+        row:SetRemoveHoverHighlighted(true)
+      end
+    end)
+    row.cells.remove:HookScript("OnLeave", function()
+      row:SetRemoveHoverHighlighted(false)
+    end)
   end
 
   if row.wonBox then
@@ -2282,6 +2576,10 @@ function TestUI:PopulatePlayerRow(row, data)
   if not row or not data or not row.cells then
     return
   end
+  if row.SetRemoveHoverHighlighted then
+    row:SetRemoveHoverHighlighted(false)
+  end
+  row.canRemoveHoverHighlight = false
   row.data = data
   local cells = row.cells
 
@@ -2352,9 +2650,12 @@ function TestUI:PopulatePlayerRow(row, data)
   if cells.remove then
     if GLD:IsAdmin() and self.queueEditEnabled then
       cells.remove:SetShown(true)
-      cells.remove:SetEnabled(data.playerKey ~= nil)
+      local canRemove = data.playerKey ~= nil
+      cells.remove:SetEnabled(canRemove)
+      row.canRemoveHoverHighlight = canRemove == true
     else
       cells.remove:SetShown(false)
+      row.canRemoveHoverHighlight = false
     end
   end
 end
@@ -2874,6 +3175,7 @@ function TestUI:RefreshTestPanel()
   if self.sessionStatus then
     self.sessionStatus:SetText("Session Status: " .. (sessionActive and "|cff00ff00ACTIVE|r" or "|cffff0000INACTIVE|r"))
   end
+  self:RefreshGuestSimStatus()
 
   local list = BuildAdminRosterList() or {}
 

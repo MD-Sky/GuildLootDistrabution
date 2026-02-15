@@ -41,8 +41,15 @@ function LiveProvider:GetPlayerName(key)
     for i = 1, GetNumGroupMembers() do
       local unit = "raid" .. i
       if UnitExists(unit) and UnitGUID(unit) == key then
-        GLD:UpsertPlayerFromUnit(unit)
-        player = self:GetPlayer(key)
+        if GLD.IsTrackedRaidUnit and GLD:IsTrackedRaidUnit(unit) then
+          local trackedKey = GLD.GetTrackedPlayerKeyForUnit and GLD:GetTrackedPlayerKeyForUnit(unit) or key
+          if trackedKey and trackedKey ~= key then
+            player = self:GetPlayer(trackedKey)
+          else
+            GLD:UpsertPlayerFromUnit(unit)
+            player = self:GetPlayer(key)
+          end
+        end
         break
       end
     end

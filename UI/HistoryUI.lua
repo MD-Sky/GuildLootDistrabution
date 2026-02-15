@@ -100,6 +100,15 @@ local function ResolveWinnerVote(item)
   return nil
 end
 
+local function IsLostHistoryItem(item)
+  if not item then
+    return false
+  end
+  local reason = item.resolutionReason and tostring(item.resolutionReason):upper() or nil
+  local status = item.rollStatus and tostring(item.rollStatus):upper() or nil
+  return reason == "LOST" or status == "LOST"
+end
+
 local function BuildVoteCounts(entry)
   local counts = { NEED = 0, GREED = 0, TRANSMOG = 0, PASS = 0 }
   if entry and entry.voteCounts then
@@ -321,7 +330,11 @@ local function AddHistoryLootEntry(self, item, entryKey)
   local winnerLabel = AceGUI:Create("InteractiveLabel")
   winnerLabel:SetWidth(160)
   local displayWinner = GetHistoryDisplayName(item.winnerName or "None", item.winnerKey, item.winnerIsGuest)
-  winnerLabel:SetText("Winner: " .. tostring(displayWinner))
+  if IsLostHistoryItem(item) then
+    winnerLabel:SetText("Winner: LOST/VOID")
+  else
+    winnerLabel:SetText("Winner: " .. tostring(displayWinner))
+  end
   winnerLabel:SetCallback("OnClick", function()
     ToggleHistoryLootEntry(self, entryKey)
     self:RefreshHistoryDetails()
@@ -681,7 +694,11 @@ function UI:ShowHistorySummaryPopup(session)
     lines[#lines + 1] = string.format("Boss: %s (%s)", boss.encounterName or "Boss", FormatDateTime(boss.killedAt))
     for _, item in ipairs(boss.loot or {}) do
       local displayWinner = GetHistoryDisplayName(item.winnerName or "None", item.winnerKey, item.winnerIsGuest)
-      lines[#lines + 1] = string.format("  - %s -> %s", item.itemName or item.itemLink or "Unknown Item", displayWinner)
+      if IsLostHistoryItem(item) then
+        lines[#lines + 1] = string.format("  - %s -> LOST/VOID", item.itemName or item.itemLink or "Unknown Item")
+      else
+        lines[#lines + 1] = string.format("  - %s -> %s", item.itemName or item.itemLink or "Unknown Item", displayWinner)
+      end
     end
   end
 

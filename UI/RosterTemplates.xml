@@ -2,4 +2,7 @@
   <Button name="GLDRosterRowTemplate" virtual="true" inherits="BackdropTemplate">
     <Size x="1" y="20"/>
   </Button>
+  <Frame name="GLDGuestAnchorsRowTemplate" virtual="true" inherits="BackdropTemplate">
+    <Size x="1" y="20"/>
+  </Frame>
 </Ui>

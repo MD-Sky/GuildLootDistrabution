@@ -764,12 +764,40 @@ function GLD:InitConfig()
             set = function(_, val) GLD.db.config.greedWinnerMove = val end,
             order = 2,
           },
+          pugsInRaid = {
+            type = "toggle",
+            name = function()
+              local enabled = GLD.GetPugsInRaid and GLD:GetPugsInRaid()
+              return enabled and "Pugs in raid (ON)" or "Pugs in raid (OFF)"
+            end,
+            desc = "Manual approval mode: keep loot table/votes, disable Blizzard roll blockers, and require admin confirm/lost.",
+            get = function()
+              return GLD.GetPugsInRaid and GLD:GetPugsInRaid() or false
+            end,
+            set = function(_, val)
+              if GLD.RequestSetPugsInRaid then
+                GLD:RequestSetPugsInRaid(val == true)
+              elseif GLD.SetPugsInRaid then
+                GLD:SetPugsInRaid(val == true)
+              end
+            end,
+            hidden = function() return not GLD:CanLocalSeeAdminUI() end,
+            order = 3,
+          },
             debugLogs = {
               type = "toggle",
               name = "Enable debug logs",
               desc = "Log debug messages to the debug window (/glddebug).",
-              get = function() return GLD.db.config.debugLogs == true end,
-              set = function(_, val) GLD.db.config.debugLogs = val and true or false end,
+              get = function()
+                local ui = GLD.GetUIConfig and GLD:GetUIConfig() or nil
+                return ui and ui.debugLogs == true or false
+              end,
+              set = function(_, val)
+                local ui = GLD.GetUIConfig and GLD:GetUIConfig() or nil
+                if ui then
+                  ui.debugLogs = val and true or false
+                end
+              end,
             hidden = function() return not GLD:CanLocalSeeAdminUI() end,
             order = 99,
           },

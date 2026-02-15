@@ -3,6 +3,7 @@ local GLD = NS.GLD
 local UI = NS.UI
 local LiveProvider = NS.LiveProvider
 local TestProvider = NS.TestProvider
+local AceGUI = LibStub and LibStub("AceGUI-3.0", true) or nil
 
 local WINDOW_WIDTH = 440
 local WINDOW_HEIGHT = 480
@@ -15,6 +16,13 @@ local TOOLTIP_CURSOR_OFFSET = 20
 local PENDING_BORDER_ACTIVE = { 1, 0.82, 0, 1 }
 local PENDING_BORDER_DEFAULT = { 0.3, 0.3, 0.3, 0.9 }
 local DEFAULT_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
+local PREVIEW_CONFIRM_POPUP_KEY = "GLD_ADMIN_TEST_CONFIRM_OBTAINED"
+
+local function AdminTestLog(message)
+  if GLD and GLD.Debug then
+    GLD:Debug("[AdminTest] " .. tostring(message))
+  end
+end
 
 local TRINKET_ROLE_LABELS = {
   TANK = "Tanks",
@@ -75,6 +83,29 @@ local function GetVoteProvider(session)
     return TestProvider or LiveProvider
   end
   return LiveProvider
+end
+
+local function GetSessionStatus(session)
+  if not session then
+    return "CLOSED"
+  end
+  if GLD and GLD.GetRollStatus then
+    return GLD:GetRollStatus(session)
+  end
+  if session.status then
+    return tostring(session.status):upper()
+  end
+  return session.locked and "CLOSED" or "ACTIVE"
+end
+
+local function CanonicalizeVoteKey(key)
+  if not key then
+    return nil
+  end
+  if GLD and GLD.GetRollCandidateKey then
+    return GLD:GetRollCandidateKey(key) or key
+  end
+  return key
 end
 
 local function StripRealmForDisplay(name)
@@ -204,17 +235,246 @@ local function GetLootWindowState(self)
     demoMode = false,
     demoItems = {},
     demoVotes = {},
+    previewMode = "member",
+    previewAuthority = nil,
+    previewPugMode = false,
   }
   return self.lootVoteState
 end
 
+local function IsAdminPreview(state)
+  return state and state.demoMode and state.previewAuthority == "admin"
+end
+
+local function GetPreviewParticipantMeta(session, key)
+  if not session or type(session.previewParticipants) ~= "table" or not key then
+    return nil
+  end
+  return session.previewParticipants[key]
+end
+
+local function IsPreviewNoAddonParticipant(session, key)
+  local meta = GetPreviewParticipantMeta(session, key)
+  return meta and meta.isNoAddon == true
+end
+
+local function GetPreviewParticipantLabel(session, key, fallback)
+  local meta = GetPreviewParticipantMeta(session, key)
+  if meta and type(meta.label) == "string" and meta.label ~= "" then
+    return meta.label
+  end
+  return fallback
+end
+
+local function NormalizeSessionKey(session, key)
+  if not key then
+    return nil
+  end
+  if GetPreviewParticipantMeta(session, key) then
+    return key
+  end
+  return CanonicalizeVoteKey(key)
+end
+
+local function BuildMissingVoteKeys(session, votes, opts)
+  local missing = {}
+  if not session then
+    return missing
+  end
+  opts = opts or {}
+  local includeNoAddon = opts.includeNoAddon ~= false
+  votes = votes or session.votes or {}
+  local expected = session.expectedVoters or {}
+  local voted = {}
+  for key in pairs(votes) do
+    local canon = NormalizeSessionKey(session, key)
+    if canon then
+      voted[canon] = true
+    end
+  end
+  for _, key in ipairs(expected) do
+    local canon = NormalizeSessionKey(session, key)
+    if canon and not voted[canon] then
+      if includeNoAddon or not IsPreviewNoAddonParticipant(session, canon) then
+        missing[#missing + 1] = canon
+      end
+    end
+  end
+  return missing
+end
+
+local function BuildMissingVoterDisplay(session, votes, opts)
+  local missing = {}
+  if not session then
+    return missing
+  end
+  opts = opts or {}
+  local includeNoAddon = opts.includeNoAddon ~= false
+  local expected = session.expectedVoters or {}
+  local classHint = session.expectedVoterClasses
+  local provider = GetVoteProvider(session)
+  local voted = {}
+  for key in pairs(votes or {}) do
+    local canon = NormalizeSessionKey(session, key)
+    if canon then
+      voted[canon] = true
+    end
+  end
+  for _, key in ipairs(expected) do
+    local canon = NormalizeSessionKey(session, key)
+    if canon and not voted[canon] then
+      local isNoAddon = IsPreviewNoAddonParticipant(session, canon)
+      if includeNoAddon or not isNoAddon then
+        if isNoAddon then
+          missing[#missing + 1] = GetPreviewParticipantLabel(session, canon, "pug")
+        else
+          missing[#missing + 1] = GetColoredVoterName(provider, canon, classHint) or canon
+        end
+      end
+    end
+  end
+  return missing
+end
+
+local function IsPreviewPugWaitingForNoAddon(session)
+  return session and session.previewPugMode == true and session.obtainedConfirmed ~= true
+end
+
+local function IsPreviewConfirmAllowed(state, session)
+  if not IsAdminPreview(state) or not session then
+    return false
+  end
+  if session.previewPugMode == true then
+    return session.obtainedConfirmed ~= true
+  end
+  return session.isPugRun == true
+end
+
+local function GetPreviewWinnerName(session)
+  if not session then
+    return nil
+  end
+  if session.previewWinnerName and session.previewWinnerName ~= "" then
+    return session.previewWinnerName
+  end
+  return session.winnerName or session.computedWinnerGuid
+end
+
+local function GetPreviewMissingKeys(session, votes)
+  local includeNoAddon = IsPreviewPugWaitingForNoAddon(session)
+  if session and session.previewPugMode == true then
+    return BuildMissingVoteKeys(session, votes, { includeNoAddon = includeNoAddon })
+  end
+  return BuildMissingVoteKeys(session, votes)
+end
+
+local function GetPreviewMissingAddonDisplay(session, votes)
+  return BuildMissingVoterDisplay(session, votes, { includeNoAddon = false })
+end
+
+local function GetPreviewMissingDisplay(session, votes)
+  if session and session.previewPugMode == true then
+    return BuildMissingVoterDisplay(session, votes, {
+      includeNoAddon = IsPreviewPugWaitingForNoAddon(session),
+    })
+  end
+  return BuildMissingVoterDisplay(session, votes, { includeNoAddon = true })
+end
+
+local function BuildForceVoteCandidates(session, votes)
+  local pendingKeys = BuildMissingVoteKeys(session, votes, { includeNoAddon = false })
+  local provider = GetVoteProvider(session)
+  local values = {}
+  local order = {}
+  for _, key in ipairs(pendingKeys) do
+    if values[key] == nil then
+      values[key] = GetVoterDisplayName(provider, key) or key
+      order[#order + 1] = key
+    end
+  end
+  return order, values
+end
+
+local function CountPreviewDismissedMissing(session, missingKeys)
+  if not session or type(session.previewDismissedCandidates) ~= "table" then
+    return 0
+  end
+  local count = 0
+  for _, key in ipairs(missingKeys or {}) do
+    if session.previewDismissedCandidates[key] then
+      count = count + 1
+    end
+  end
+  return count
+end
+
+local function ApplyPreviewForcePending(self, state, entry)
+  if not entry or not entry.session then
+    return
+  end
+  local session = entry.session
+  local votes = {}
+  if session.votes then
+    for k, v in pairs(session.votes) do
+      local canon = NormalizeSessionKey(session, k)
+      if canon and votes[canon] == nil then
+        votes[canon] = v
+      end
+    end
+  end
+  if state and state.demoMode and state.demoVotes and entry.key then
+    local localKey = NS:GetPlayerKeyFromUnit("player")
+    if localKey and state.demoVotes[entry.key] then
+      votes[localKey] = state.demoVotes[entry.key]
+    end
+  end
+  local missingKeys = GetPreviewMissingKeys(session, votes)
+  session.previewDismissedCandidates = session.previewDismissedCandidates or {}
+  local affected = 0
+  for _, key in ipairs(missingKeys) do
+    if session.previewDismissedCandidates[key] then
+      session.previewDismissedCandidates[key] = nil
+      affected = affected + 1
+    end
+  end
+  if affected == 0 then
+    affected = #missingKeys
+  end
+  session.previewForcePendingAt = GetServerTime()
+  local itemId = session.rollKey or session.rollID or entry.key or "unknown"
+  AdminTestLog("ForcePending item=" .. tostring(itemId) .. " affected=" .. tostring(affected))
+  local ok, err = pcall(function()
+    self:RefreshLootWindow({
+      forceShow = true,
+      forceDemo = true,
+      activeKey = entry.key,
+    })
+  end)
+  if not ok and GLD and GLD.Print then
+    GLD:Print("Preview force pending refresh failed: " .. tostring(err))
+  end
+end
+
+local function IsLootGateActive()
+  if not GLD then
+    return false
+  end
+  local enabled = GLD.IsEnabled and GLD:IsEnabled()
+  local active = GLD.IsSessionActive and GLD:IsSessionActive()
+  return enabled and active
+end
+
 local function GetActiveVoteSessions()
   local sessions = {}
+  if not IsLootGateActive() then
+    return sessions
+  end
   if not GLD.activeRolls then
     return sessions
   end
   for _, session in pairs(GLD.activeRolls) do
-    if session and not session.locked then
+    local status = GetSessionStatus(session)
+    if session and (status == "ACTIVE" or status == "PENDING_APPROVAL") then
       sessions[#sessions + 1] = session
     end
   end
@@ -239,39 +499,14 @@ local function GetSessionByKey(itemKey)
   return nil
 end
 
-local function BuildVoteEntries(self, sessions)
-  local state = GetLootWindowState(self)
-  state.currentVoteItems = {}
-  state.indexByKey = {}
-  local myKey = NS:GetPlayerKeyFromUnit("player")
-  for idx, session in ipairs(sessions or {}) do
-    local key = session.rollKey
-      or session.rollID
-      or session.key
-      or session.itemLink
-      or (session.itemName and session.itemName .. "_" .. idx)
-      or ("pending_" .. idx)
-    local vote = nil
-    if state.demoMode then
-      vote = state.demoVotes and state.demoVotes[key]
-    else
-      vote = myKey and session.votes and session.votes[myKey] or nil
-    end
-    state.currentVoteItems[idx] = {
-      key = key,
-      session = session,
-      vote = vote,
-    }
-    state.indexByKey[key] = idx
-  end
-end
-
-
 local function BuildSessionVoteSnapshot(session, state, entryKey)
   local votes = {}
   if session and session.votes then
     for k, v in pairs(session.votes) do
-      votes[k] = v
+      local canon = NormalizeSessionKey(session, k)
+      if canon and votes[canon] == nil then
+        votes[canon] = v
+      end
     end
   end
   if state and state.demoMode and state.demoVotes and entryKey then
@@ -283,6 +518,39 @@ local function BuildSessionVoteSnapshot(session, state, entryKey)
   return votes
 end
 
+if _G and _G.BuildSessionVoteSnapshot == nil then
+  _G.BuildSessionVoteSnapshot = BuildSessionVoteSnapshot
+end
+
+local function BuildVoteEntries(self, sessions)
+  local state = GetLootWindowState(self)
+  state.currentVoteItems = {}
+  state.indexByKey = {}
+  for idx, session in ipairs(sessions or {}) do
+    local key = session.rollKey
+      or session.rollID
+      or session.key
+      or session.itemLink
+      or (session.itemName and session.itemName .. "_" .. idx)
+      or ("pending_" .. idx)
+    local vote = nil
+    if state.demoMode then
+      vote = state.demoVotes and state.demoVotes[key]
+    else
+      local votes = BuildSessionVoteSnapshot(session, state, key)
+      local myKey = NS:GetPlayerKeyFromUnit("player")
+      vote = myKey and votes and votes[myKey] or nil
+    end
+    state.currentVoteItems[idx] = {
+      key = key,
+      session = session,
+      vote = vote,
+    }
+    state.indexByKey[key] = idx
+  end
+end
+
+
 local function HasLocalPlayerVotedSession(session, votes)
   if not session then
     return false
@@ -291,7 +559,7 @@ local function HasLocalPlayerVotedSession(session, votes)
   if not localKey then
     return false
   end
-  votes = votes or session.votes or {}
+  votes = votes or BuildSessionVoteSnapshot(session)
   return votes[localKey] ~= nil
 end
 
@@ -300,7 +568,7 @@ local function HasUnvotedEntries(state, entries)
     return false
   end
   for _, entry in ipairs(entries or {}) do
-    if entry and not entry.vote then
+    if entry and entry.session and GetSessionStatus(entry.session) == "ACTIVE" and not entry.vote then
       return true
     end
   end
@@ -318,8 +586,8 @@ local function HasBlockingVotes(self)
   end
   local sessions = GetActiveVoteSessions()
   for _, session in ipairs(sessions) do
-    if session and not session.locked then
-      local votes = session.votes or {}
+    if session and GetSessionStatus(session) == "ACTIVE" then
+      local votes = BuildSessionVoteSnapshot(session)
       if votes[localKey] == nil then
         return true
       end
@@ -328,21 +596,123 @@ local function HasBlockingVotes(self)
   return false
 end
 
-local function GetMissingVotersForSession(session, votes)
-  local missing = {}
+local function GetMissingVotersForSession(session, votes, opts)
   if not session then
-    return missing
+    return {}
   end
-  votes = votes or session.votes or {}
-  local expected = session.expectedVoters or {}
-  local classHint = session.expectedVoterClasses
-  local provider = GetVoteProvider(session)
-  for _, key in ipairs(expected) do
-    if key and not votes[key] then
-      missing[#missing + 1] = GetColoredVoterName(provider, key, classHint) or key
+  return BuildMissingVoterDisplay(session, votes or session.votes or {}, opts)
+end
+
+local function IsGuidKey(key)
+  return type(key) == "string" and key:find("^Player%-") ~= nil
+end
+
+local function FormatNameRealm(name, realm)
+  if not name or name == "" then
+    return nil
+  end
+  if realm and realm ~= "" then
+    return tostring(name) .. "-" .. tostring(realm)
+  end
+  return tostring(name)
+end
+
+local function SplitKeyIdentity(key)
+  if type(key) ~= "string" or key == "" then
+    return nil, nil, nil
+  end
+  if IsGuidKey(key) then
+    return key, nil, nil
+  end
+  if NS and NS.SplitNameRealm then
+    local name, realm = NS:SplitNameRealm(key)
+    if name and name ~= "" then
+      return nil, name, realm
     end
   end
-  return missing
+  return nil, key, nil
+end
+
+local function BuildDebugListFromArray(list, limit)
+  local out = {}
+  local max = math.min(limit or 12, #list)
+  for i = 1, max do
+    out[#out + 1] = tostring(list[i])
+  end
+  if #list > max then
+    out[#out + 1] = "...+" .. tostring(#list - max)
+  end
+  return table.concat(out, ", ")
+end
+
+local function BuildDebugListFromMap(map, limit, includeValues)
+  local out = {}
+  local count = 0
+  for key, value in pairs(map or {}) do
+    count = count + 1
+    if #out < (limit or 12) then
+      if includeValues then
+        out[#out + 1] = tostring(key) .. "=" .. tostring(value)
+      else
+        out[#out + 1] = tostring(key)
+      end
+    end
+  end
+  if count > (limit or 12) then
+    out[#out + 1] = "...+" .. tostring(count - (limit or 12))
+  end
+  return table.concat(out, ", "), count
+end
+
+local function ResolveGuestAnchorCandidateKey(session, provider, rawKey, canonicalKey)
+  if not (GLD and GLD.FindApprovedGuestEntry) then
+    return nil, nil
+  end
+  local guid, name, realm = SplitKeyIdentity(rawKey)
+  if not guid and not name then
+    guid, name, realm = SplitKeyIdentity(canonicalKey)
+  end
+  local lookupKeys = { canonicalKey, rawKey }
+  for _, key in ipairs(lookupKeys) do
+    if provider and provider.GetPlayer and key then
+      local player = provider:GetPlayer(key)
+      if player then
+        if not guid and player.guid and player.guid ~= "" then
+          guid = player.guid
+        end
+        if not name and player.name and player.name ~= "" then
+          name = player.name
+        end
+        if not realm and player.realm and player.realm ~= "" then
+          realm = player.realm
+        end
+      end
+    end
+  end
+  local approvedEntry, approvedKey = GLD:FindApprovedGuestEntry(guid, name, realm)
+  return approvedKey, approvedEntry
+end
+
+local function BuildOverrideCandidateLabel(provider, key, fallbackName, isGuest)
+  local display = GetVoterDisplayName(provider, key)
+  local hasDisplay = type(display) == "string" and display ~= "" and display ~= tostring(key)
+  if hasDisplay and isGuest ~= true then
+    return display
+  end
+  local name = fallbackName
+  if (not name or name == "") and provider and provider.GetPlayerName then
+    name = provider:GetPlayerName(key)
+  end
+  if not name or name == "" or name == key then
+    name = tostring(key)
+  end
+  if NS and NS.GetPlayerDisplayName then
+    return NS:GetPlayerDisplayName(name, isGuest == true)
+  end
+  if isGuest then
+    return tostring(StripRealmForDisplay(name) or name) .. " - Guest"
+  end
+  return StripRealmForDisplay(name) or name
 end
 
 local function BuildAdminOverrideCandidates(session)
@@ -354,50 +724,360 @@ local function BuildAdminOverrideCandidates(session)
 
   local provider = GetVoteProvider(session)
   local expected = session.expectedVoters or {}
-  local classHint = session.expectedVoterClasses
-  local itemRef = session.itemLink or session.itemID or session.itemName
-  local canFilter = itemRef and GLD and GLD.IsEligibleForNeed
-  local itemReady = true
-  if canFilter and C_Item and C_Item.GetItemInfoInstant then
-    local classID = C_Item.GetItemInfoInstant(itemRef)
-    if not classID then
-      itemReady = false
-      if GLD.RequestItemData then
-        GLD:RequestItemData(itemRef)
+  local votes = session.votes or {}
+  local voteDetails = session.voteDetails or {}
+  local approvedGuests = GLD and GLD.db and GLD.db.approvedGuests or nil
+  local debugEnabled = GLD and GLD.IsDebugEnabled and GLD:IsDebugEnabled() or false
+  local rollRef = session.rollID or session.rollKey or "unknown"
+  local itemRef = session.itemLink or session.itemID or session.itemName or "unknown"
+
+  if debugEnabled then
+    local expectedText = BuildDebugListFromArray(expected, 20)
+    local voteText, voteCount = BuildDebugListFromMap(votes, 20, true)
+    local detailText, detailCount = BuildDebugListFromMap(voteDetails, 20, false)
+    local approvedText, approvedCount = BuildDebugListFromMap(approvedGuests or {}, 20, false)
+    GLD:Debug("Admin override candidate build: rollID=" .. tostring(rollRef) .. " item=" .. tostring(itemRef))
+    GLD:Debug("Admin override source expectedVoters(" .. tostring(#expected) .. "): " .. tostring(expectedText))
+    GLD:Debug("Admin override source votes(" .. tostring(voteCount) .. "): " .. tostring(voteText))
+    GLD:Debug("Admin override source voteDetails(" .. tostring(detailCount) .. "): " .. tostring(detailText))
+    GLD:Debug("Admin override source approvedGuests(" .. tostring(approvedCount) .. "): " .. tostring(approvedText))
+  end
+
+  local added = {}
+  local expectedIdentity = {}
+  for _, key in ipairs(expected) do
+    if key then
+      expectedIdentity[key] = true
+      local canon = NormalizeSessionKey(session, key) or CanonicalizeVoteKey(key)
+      if canon then
+        expectedIdentity[canon] = true
       end
     end
   end
 
-  local function isEligible(key)
-    if not canFilter or not itemReady then
-      return true
+  local function addCandidate(rawKey, sourceTag)
+    if not rawKey or rawKey == "" then
+      if debugEnabled then
+        GLD:Debug("Admin override candidate filtered: source=" .. tostring(sourceTag) .. " raw=nil reason=empty_key")
+      end
+      return
     end
-    if GLD and GLD.GetEligibilityForVote then
-      local ok = GLD:GetEligibilityForVote(session, key, "NEED")
-      return ok == true
+
+    local canonical = NormalizeSessionKey(session, rawKey) or CanonicalizeVoteKey(rawKey) or rawKey
+    if not canonical or canonical == "" then
+      if debugEnabled then
+        GLD:Debug(
+          "Admin override candidate filtered: source="
+            .. tostring(sourceTag)
+            .. " raw="
+            .. tostring(rawKey)
+            .. " reason=canonicalize_failed"
+        )
+      end
+      return
     end
-    return true
+
+    local guestKey, guestEntry = ResolveGuestAnchorCandidateKey(session, provider, rawKey, canonical)
+    local resolvedKey = guestKey or canonical
+    if GLD and GLD.GetRollCandidateKey then
+      resolvedKey = GLD:GetRollCandidateKey(resolvedKey) or resolvedKey
+    end
+    if not resolvedKey or resolvedKey == "" then
+      if debugEnabled then
+        GLD:Debug(
+          "Admin override candidate filtered: source="
+            .. tostring(sourceTag)
+            .. " raw="
+            .. tostring(rawKey)
+            .. " canonical="
+            .. tostring(canonical)
+            .. " reason=resolved_key_missing"
+        )
+      end
+      return
+    end
+
+    if added[resolvedKey] then
+      if debugEnabled then
+        GLD:Debug(
+          "Admin override candidate filtered: source="
+            .. tostring(sourceTag)
+            .. " raw="
+            .. tostring(rawKey)
+            .. " canonical="
+            .. tostring(canonical)
+            .. " resolved="
+            .. tostring(resolvedKey)
+            .. " reason=duplicate"
+        )
+      end
+      return
+    end
+
+    local player = provider and provider.GetPlayer and (provider:GetPlayer(resolvedKey) or provider:GetPlayer(canonical)) or nil
+    local isGuest = false
+    if player and GLD and GLD.IsGuestEntry then
+      isGuest = GLD:IsGuestEntry(player)
+    end
+    if not isGuest and GLD and GLD.IsApprovedGuestKey then
+      isGuest = GLD:IsApprovedGuestKey(resolvedKey)
+    end
+    if not isGuest and guestKey then
+      isGuest = true
+    end
+
+    local fallbackName = nil
+    if player then
+      fallbackName = FormatNameRealm(player.name, player.realm)
+    elseif guestEntry then
+      fallbackName = FormatNameRealm(guestEntry.name, guestEntry.realm)
+    end
+
+    local label = BuildOverrideCandidateLabel(provider, resolvedKey, fallbackName, isGuest)
+    keys[#keys + 1] = resolvedKey
+    labels[#labels + 1] = label
+    added[resolvedKey] = true
+
+    if debugEnabled then
+      local guid, name, realm = SplitKeyIdentity(resolvedKey)
+      if guestEntry then
+        if not guid and guestEntry.guid and guestEntry.guid ~= "" then
+          guid = guestEntry.guid
+        end
+        if not name and guestEntry.name and guestEntry.name ~= "" then
+          name = guestEntry.name
+        end
+        if not realm and guestEntry.realm and guestEntry.realm ~= "" then
+          realm = guestEntry.realm
+        end
+      end
+      GLD:Debug(
+        "Admin override candidate added: source="
+          .. tostring(sourceTag)
+          .. " raw="
+          .. tostring(rawKey)
+          .. " canonical="
+          .. tostring(canonical)
+          .. " resolved="
+          .. tostring(resolvedKey)
+          .. " name="
+          .. tostring(name or (player and player.name) or fallbackName or "")
+          .. " guid="
+          .. tostring(guid or (player and player.guid) or "")
+          .. " guest="
+          .. tostring(isGuest)
+          .. " voted="
+          .. tostring(votes[resolvedKey] ~= nil or votes[canonical] ~= nil)
+      )
+    end
   end
 
   for _, key in ipairs(expected) do
-    if key and isEligible(key) then
-      keys[#keys + 1] = key
-      labels[#labels + 1] = GetVoterDisplayName(provider, key) or key
+    addCandidate(key, "expectedVoters")
+  end
+  for key in pairs(votes) do
+    addCandidate(key, "votes")
+  end
+  for key in pairs(voteDetails) do
+    addCandidate(key, "voteDetails")
+  end
+
+  for guestKey, guestEntry in pairs(approvedGuests or {}) do
+    if type(guestEntry) == "table" then
+      local guestGuid = guestEntry.guid
+      local guestFull = FormatNameRealm(guestEntry.name, guestEntry.realm)
+      if expectedIdentity[guestKey] or (guestGuid and expectedIdentity[guestGuid]) or (guestFull and expectedIdentity[guestFull]) then
+        addCandidate(guestKey, "approvedGuests")
+      elseif debugEnabled then
+        GLD:Debug(
+          "Admin override candidate filtered: source=approvedGuests raw="
+            .. tostring(guestKey)
+            .. " reason=not_in_roll_participants"
+        )
+      end
+    elseif debugEnabled then
+      GLD:Debug(
+        "Admin override candidate filtered: source=approvedGuests raw="
+          .. tostring(guestKey)
+          .. " reason=invalid_entry"
+      )
     end
   end
 
-  if #keys == 0 and provider and provider.GetPlayers then
-    for key, player in pairs(provider:GetPlayers() or {}) do
-      if key and isEligible(key) then
-        keys[#keys + 1] = key
-        labels[#labels + 1] = GetVoterDisplayName(provider, key)
-          or (player and (player.name or player.fullName))
-          or tostring(key)
-      end
-    end
+  if debugEnabled then
+    local preview = BuildDebugListFromArray(labels, 12)
+    GLD:Debug(
+      "Admin override candidate build complete: rollID="
+        .. tostring(rollRef)
+        .. " total="
+        .. tostring(#keys)
+        .. " candidates="
+        .. tostring(preview)
+    )
   end
 
   return keys, labels
+end
+
+local function EnsurePreviewConfirmPopup()
+  if not StaticPopupDialogs or StaticPopupDialogs[PREVIEW_CONFIRM_POPUP_KEY] then
+    return
+  end
+  StaticPopupDialogs[PREVIEW_CONFIRM_POPUP_KEY] = {
+    text = "Mark item as obtained?",
+    button1 = YES,
+    button2 = NO,
+    OnAccept = function(_, data)
+      local uiRef = data and data.ui
+      local session = data and data.session
+      if not uiRef or not session then
+        return
+      end
+      session.obtainedConfirmed = true
+      session.previewObtained = true
+      local winner = GetPreviewWinnerName(session) or "Unknown"
+      session.computedWinnerGuid = session.computedWinnerGuid or winner
+      session.winnerName = session.winnerName or winner
+      local itemId = session.rollKey or session.rollID or session.itemLink or session.itemName or "unknown"
+      AdminTestLog("ConfirmObtained item=" .. tostring(itemId) .. " winner=" .. tostring(winner))
+      local ok, err = pcall(function()
+        uiRef:RefreshLootWindow({
+          forceShow = true,
+          forceDemo = true,
+          activeKey = data.entryKey,
+        })
+      end)
+      if not ok and GLD and GLD.Print then
+        GLD:Print("Preview confirm refresh failed: " .. tostring(err))
+      end
+    end,
+    timeout = 0,
+    whileDead = true,
+    hideOnEscape = true,
+    preferredIndex = 3,
+  }
+end
+
+local function ShowPreviewForceVotePopup(self, state, session, entryKey)
+  if not AceGUI then
+    if GLD and GLD.Print then
+      GLD:Print("Preview force vote unavailable (AceGUI missing).")
+    end
+    return
+  end
+  local votes = BuildSessionVoteSnapshot(session, state, entryKey)
+  local candidateOrder, candidateValues = BuildForceVoteCandidates(session, votes)
+  if #candidateOrder == 0 then
+    if GLD and GLD.Print then
+      GLD:Print("No pending voters left to force in preview.")
+    end
+    return
+  end
+
+  if self.previewForceVoteFrame then
+    self.previewForceVoteFrame:Release()
+    self.previewForceVoteFrame = nil
+  end
+
+  local provider = GetVoteProvider(session)
+
+  local voteValues = {
+    NEED = "Need",
+    GREED = "Greed",
+    TRANSMOG = "Transmog",
+    PASS = "Pass",
+  }
+  local voteOrder = { "NEED", "GREED", "TRANSMOG", "PASS" }
+
+  local frame = AceGUI:Create("Frame")
+  frame:SetTitle("Preview Force Vote")
+  frame:SetStatusText("Admin test only")
+  frame:SetWidth(360)
+  frame:SetHeight(210)
+  frame:SetLayout("Flow")
+  frame:EnableResize(false)
+  frame:SetCallback("OnClose", function(widget)
+    if self.previewForceVoteFrame == widget then
+      self.previewForceVoteFrame = nil
+    end
+  end)
+
+  local candidateDropdown = AceGUI:Create("Dropdown")
+  candidateDropdown:SetLabel("Candidate")
+  candidateDropdown:SetFullWidth(true)
+  frame:AddChild(candidateDropdown)
+
+  local voteDropdown = AceGUI:Create("Dropdown")
+  voteDropdown:SetLabel("Vote")
+  voteDropdown:SetFullWidth(true)
+  voteDropdown:SetList(voteValues, voteOrder)
+  voteDropdown:SetValue("NEED")
+  frame:AddChild(voteDropdown)
+
+  local applyBtn = nil
+  local function refreshCandidates()
+    local snapshot = BuildSessionVoteSnapshot(session, state, entryKey)
+    local order, values = BuildForceVoteCandidates(session, snapshot)
+    candidateDropdown:SetList(values, order)
+    if #order == 0 then
+      candidateDropdown:SetValue(nil)
+      applyBtn:SetDisabled(true)
+      frame:SetStatusText("No pending addon voters for this item.")
+      return false
+    end
+    local current = candidateDropdown:GetValue()
+    if not current or values[current] == nil then
+      candidateDropdown:SetValue(order[1])
+    end
+    applyBtn:SetDisabled(false)
+    frame:SetStatusText("Admin test only")
+    return true
+  end
+
+  applyBtn = AceGUI:Create("Button")
+  applyBtn:SetText("Apply (Preview)")
+  applyBtn:SetWidth(140)
+  applyBtn:SetCallback("OnClick", function()
+    local key = candidateDropdown:GetValue()
+    local vote = voteDropdown:GetValue()
+    if not key or not vote then
+      return
+    end
+    session.votes = session.votes or {}
+    session.votes[key] = vote
+    if session.previewDismissedCandidates then
+      session.previewDismissedCandidates[key] = nil
+    end
+    local itemId = session.rollKey or session.rollID or entryKey or "unknown"
+    local voterName = GetVoterDisplayName(provider, key) or tostring(key)
+    AdminTestLog("ForceVote item=" .. tostring(itemId) .. " voter=" .. tostring(voterName) .. " choice=" .. tostring(vote))
+    local ok, err = pcall(function()
+      self:RefreshLootWindow({
+        forceShow = true,
+        forceDemo = true,
+        activeKey = entryKey,
+      })
+    end)
+    if not ok and GLD and GLD.Print then
+      GLD:Print("Preview force vote refresh failed: " .. tostring(err))
+    end
+    refreshCandidates()
+  end)
+  frame:AddChild(applyBtn)
+
+  local cancelBtn = AceGUI:Create("Button")
+  cancelBtn:SetText("Cancel")
+  cancelBtn:SetWidth(100)
+  cancelBtn:SetCallback("OnClick", function()
+    frame:Release()
+    if self.previewForceVoteFrame == frame then
+      self.previewForceVoteFrame = nil
+    end
+  end)
+  frame:AddChild(cancelBtn)
+
+  refreshCandidates()
+  self.previewForceVoteFrame = frame
 end
 
 function UI:GetMissingVotersForItem(itemKey)
@@ -408,8 +1088,7 @@ end
 
 function UI:HasLocalPlayerVoted(itemKey)
   local session = GetSessionByKey(itemKey)
-  local votes = session and session.votes or nil
-  return HasLocalPlayerVotedSession(session, votes)
+  return HasLocalPlayerVotedSession(session, nil)
 end
 
 local function GetNextUnvotedItemIndex(self, startIndex)
@@ -474,14 +1153,20 @@ local function CreatePendingRow(self, window)
     local uiX = cursorX / scale
     local uiY = cursorY / scale
     local offset = TOOLTIP_CURSOR_OFFSET
-    local parentWidth = UIParent and UIParent.GetWidth and UIParent:GetWidth() or 0
+    local parentWidth = UIParent and UIParent.GetWidth and UIParent:GetWidth() or nil
+    if issecretvalue and issecretvalue(parentWidth) then
+      parentWidth = nil
+    end
     local tooltipWidth = GameTooltip and GameTooltip.GetWidth and GameTooltip:GetWidth() or nil
+    if issecretvalue and issecretvalue(tooltipWidth) then
+      tooltipWidth = nil
+    end
     if type(tooltipWidth) ~= "number" or tooltipWidth <= 0 then
       tooltipWidth = 220
     end
     local point = "BOTTOMLEFT"
     local anchorX = uiX + offset
-    if parentWidth > 0 and anchorX + tooltipWidth > parentWidth then
+    if type(parentWidth) == "number" and parentWidth > 0 and anchorX + tooltipWidth > parentWidth then
       point = "BOTTOMRIGHT"
       anchorX = uiX - offset
     end
@@ -587,6 +1272,20 @@ local function EnsureLootWindow(self)
   frame:SetScript("OnHide", function()
     local state = GetLootWindowState(self)
     state.demoMode = false
+    state.previewMode = "member"
+    state.previewAuthority = nil
+    state.previewPugMode = false
+    if GLD and GLD.MarkLocalVoteDismissed then
+      for _, entry in ipairs(state.currentVoteItems or {}) do
+        local session = entry and entry.session
+        if session then
+          local votes = BuildSessionVoteSnapshot(session, state, entry.key)
+          if not HasLocalPlayerVotedSession(session, votes) then
+            GLD:MarkLocalVoteDismissed(session)
+          end
+        end
+      end
+    end
     if HasBlockingVotes(self) then
       if C_Timer and C_Timer.After then
         C_Timer.After(0.1, function()
@@ -598,6 +1297,10 @@ local function EnsureLootWindow(self)
           end
         end)
       end
+    end
+    if self.previewForceVoteFrame then
+      self.previewForceVoteFrame:Release()
+      self.previewForceVoteFrame = nil
     end
   end)
 
@@ -621,6 +1324,13 @@ local function EnsureLootWindow(self)
     if not session then
       return
     end
+    if IsAdminPreview(state) then
+      local ok, err = pcall(ShowPreviewForceVotePopup, self, state, session, entry.key)
+      if not ok and GLD and GLD.Print then
+        GLD:Print("Preview force vote failed: " .. tostring(err))
+      end
+      return
+    end
     if not GLD:IsAuthority() then
       GLD:Print("Only the authority can apply overrides.")
       return
@@ -635,6 +1345,15 @@ local function EnsureLootWindow(self)
   forcePendingButton:SetText("Force Pending")
   forcePendingButton:SetPoint("TOPRIGHT", adminOverrideButton, "TOPLEFT", -6, 0)
   forcePendingButton:SetScript("OnClick", function()
+    local state = GetLootWindowState(self)
+    local entry = state.currentVoteItems[state.activeIndex]
+    if IsAdminPreview(state) then
+      local ok, err = pcall(ApplyPreviewForcePending, self, state, entry)
+      if not ok and GLD and GLD.Print then
+        GLD:Print("Preview force pending failed: " .. tostring(err))
+      end
+      return
+    end
     if not GLD:IsAuthority() then
       GLD:Print("Only the authority can force pending windows.")
       return
@@ -644,6 +1363,69 @@ local function EnsureLootWindow(self)
     end
   end)
   forcePendingButton:Hide()
+
+  local confirmObtainedButton = CreateFrame("Button", nil, activePanel, "UIPanelButtonTemplate")
+  confirmObtainedButton:SetSize(120, 18)
+  confirmObtainedButton:SetText("Confirm Obtained")
+  confirmObtainedButton:SetPoint("TOPRIGHT", activePanel, "TOPRIGHT", -8, -24)
+  confirmObtainedButton:SetScript("OnClick", function()
+    local state = GetLootWindowState(self)
+    local entry = state.currentVoteItems[state.activeIndex]
+    local session = entry and entry.session
+    if not session then
+      return
+    end
+    if IsAdminPreview(state) then
+      local ok, err = pcall(function()
+        EnsurePreviewConfirmPopup()
+        StaticPopup_Show(PREVIEW_CONFIRM_POPUP_KEY, nil, nil, {
+          ui = self,
+          session = session,
+          entryKey = entry.key,
+        })
+      end)
+      if not ok and GLD and GLD.Print then
+        GLD:Print("Preview confirm prompt failed: " .. tostring(err))
+      end
+      return
+    end
+    if GLD and GLD.ConfirmPendingRoll then
+      GLD:ConfirmPendingRoll(session.rollKey or session.rollID, session.computedWinnerGuid)
+    end
+  end)
+  confirmObtainedButton:Hide()
+
+  local markLostButton = CreateFrame("Button", nil, activePanel, "UIPanelButtonTemplate")
+  markLostButton:SetSize(120, 18)
+  markLostButton:SetText("Mark Lost")
+  markLostButton:SetPoint("TOPRIGHT", confirmObtainedButton, "TOPLEFT", -6, 0)
+  markLostButton:SetScript("OnClick", function()
+    local state = GetLootWindowState(self)
+    local entry = state.currentVoteItems[state.activeIndex]
+    local session = entry and entry.session
+    if not session then
+      return
+    end
+    if IsAdminPreview(state) then
+      session.previewMarkedLost = not session.previewMarkedLost
+      AdminTestLog("Preview action: MarkLost winner=" .. tostring(session.winnerName or session.computedWinnerGuid or "Unknown"))
+      local ok, err = pcall(function()
+        self:RefreshLootWindow({
+          forceShow = true,
+          forceDemo = true,
+          activeKey = entry.key,
+        })
+      end)
+      if not ok and GLD and GLD.Print then
+        GLD:Print("Preview mark-lost refresh failed: " .. tostring(err))
+      end
+      return
+    end
+    if GLD and GLD.MarkPendingRollLost then
+      GLD:MarkPendingRollLost(session.rollKey or session.rollID)
+    end
+  end)
+  markLostButton:Hide()
 
   local activeIcon = activePanel:CreateTexture(nil, "ARTWORK")
   activeIcon:SetSize(36, 36)
@@ -735,6 +1517,7 @@ local function EnsureLootWindow(self)
   pendingEmpty:Hide()
 
   window.frame = frame
+  window.titleLabel = title
   window.closeButton = closeButton
   window.activePanel = activePanel
   window.activeIcon = activeIcon
@@ -743,6 +1526,8 @@ local function EnsureLootWindow(self)
   window.activeMessageLabel = votedLabel
   window.adminOverrideButton = adminOverrideButton
   window.forcePendingButton = forcePendingButton
+  window.confirmObtainedButton = confirmObtainedButton
+  window.markLostButton = markLostButton
   window.buttonRow = buttonRow
   window.needButton = needButton
   window.greedButton = greedButton
@@ -759,11 +1544,57 @@ local function EnsureLootWindow(self)
   return window
 end
 
+local function ShouldPromptPendingSessions(self, state, sessions, options)
+  local trigger = options and options.trigger or "auto"
+  local now = GetServerTime()
+  local playerName = GLD and GLD.GetUnitFullName and GLD:GetUnitFullName("player") or UnitName("player") or "player"
+  local shouldShow = false
+  for _, session in ipairs(sessions or {}) do
+    local status = GetSessionStatus(session)
+    local votes = BuildSessionVoteSnapshot(session, state)
+    local hasVoted = HasLocalPlayerVotedSession(session, votes)
+    local voteState = GLD and GLD.GetLocalVoteState and GLD:GetLocalVoteState(session) or nil
+    local dismissed = voteState and voteState.dismissedWithoutVote or false
+    local lastPromptedAt = voteState and voteState.lastPromptedAt or nil
+    local action = "SKIP"
+    if status == "PENDING_APPROVAL" then
+      action = "SHOW"
+      shouldShow = true
+    elseif not hasVoted then
+      if trigger == "force" then
+        action = "SHOW"
+        shouldShow = true
+      elseif not lastPromptedAt or dismissed then
+        action = "SHOW"
+        shouldShow = true
+      end
+    end
+    if action == "SHOW" and voteState then
+      voteState.lastPromptedAt = now
+      voteState.dismissedWithoutVote = false
+    end
+    if GLD and GLD.LilyDebug then
+      GLD:LilyDebug(
+        string.format(
+          "[VOTE] ForcePendingCheck player=%s hasVoted=%s dismissed=%s action=%s",
+          tostring(playerName),
+          tostring(hasVoted),
+          tostring(dismissed),
+          tostring(action)
+        )
+      )
+    end
+  end
+  return shouldShow
+end
+
 local function UpdateVoteButtons(window, session, alreadyVoted)
+  local sessionStatus = GetSessionStatus(session)
+  local votingOpen = sessionStatus == "ACTIVE"
   local localKey = NS.GetPlayerKeyFromUnit and NS:GetPlayerKeyFromUnit("player") or nil
   local eligibility = { NEED = true, GREED = true, TRANSMOG = true, PASS = true }
   local reasons = { NEED = nil, GREED = nil, TRANSMOG = nil, PASS = nil }
-  if session and GLD and GLD.GetEligibilityForVote then
+  if session and votingOpen and GLD and GLD.GetEligibilityForVote then
     eligibility.NEED, reasons.NEED = GLD:GetEligibilityForVote(session, localKey, "NEED", { log = true, requireData = true })
     eligibility.GREED, reasons.GREED = GLD:GetEligibilityForVote(session, localKey, "GREED", { log = true })
     eligibility.TRANSMOG, reasons.TRANSMOG = GLD:GetEligibilityForVote(session, localKey, "TRANSMOG", { log = true })
@@ -811,6 +1642,9 @@ local function UpdateVoteButtons(window, session, alreadyVoted)
       -- skip invalid button
     else
       local allow = not alreadyVoted
+      if not votingOpen then
+        allow = false
+      end
       if session and eligibility[vote] == false then
         allow = false
       end
@@ -826,7 +1660,7 @@ local function UpdateVoteButtons(window, session, alreadyVoted)
         button:SetScript("OnEnter", function(selfBtn)
           if selfBtn.gldDisabledReason then
             GameTooltip:SetOwner(selfBtn, "ANCHOR_RIGHT")
-            GameTooltip:SetText(selfBtn.gldDisabledReason, 1, 0.8, 0, true)
+            GameTooltip:SetText(selfBtn.gldDisabledReason, 1, 0.8, 0, 1, true)
             GameTooltip:Show()
           end
         end)
@@ -850,15 +1684,43 @@ end
 local function UpdateActivePanel(self, state, window)
   local index = state.activeIndex
   local entry = state.currentVoteItems[index]
-  local showOverride = entry and not state.demoMode and GLD.IsAuthority and GLD:IsAuthority()
-  local showForce = not state.demoMode and GLD.IsAuthority and GLD:IsAuthority() and IsInRaid()
+  local session = entry and entry.session or nil
+  local status = GetSessionStatus(session)
+  local isPendingApproval = status == "PENDING_APPROVAL"
+  local previewAdmin = IsAdminPreview(state)
+  local previewPugMode = previewAdmin and session and session.previewPugMode == true
+  local liveAuthority = not state.demoMode and GLD.IsAuthority and GLD:IsAuthority()
+  local showOverride = entry and status == "ACTIVE" and (previewAdmin or liveAuthority)
+  local showForce = entry and status == "ACTIVE" and (previewAdmin or (liveAuthority and IsInRaid()))
+  local showPendingActions = entry and ((previewAdmin and IsPreviewConfirmAllowed(state, session))
+    or (isPendingApproval and not state.demoMode and GLD.CanAccessAdminUI and GLD:CanAccessAdminUI()))
   if window.adminOverrideButton then
+    if previewAdmin then
+      window.adminOverrideButton:SetText("Force Vote")
+    else
+      window.adminOverrideButton:SetText("Admin Override")
+    end
     window.adminOverrideButton:SetShown(showOverride)
     window.adminOverrideButton:SetEnabled(showOverride)
   end
   if window.forcePendingButton then
+    window.forcePendingButton:SetText("Force Pending")
     window.forcePendingButton:SetShown(showForce)
     window.forcePendingButton:SetEnabled(showForce)
+  end
+  if window.confirmObtainedButton then
+    if previewAdmin and session and session.obtainedConfirmed then
+      window.confirmObtainedButton:SetText("Obtained Confirmed")
+    else
+      window.confirmObtainedButton:SetText("Confirm Obtained")
+    end
+    window.confirmObtainedButton:SetShown(showPendingActions)
+    window.confirmObtainedButton:SetEnabled(showPendingActions and (not previewPugMode or session.obtainedConfirmed ~= true))
+  end
+  if window.markLostButton then
+    local showMarkLost = showPendingActions and not previewPugMode
+    window.markLostButton:SetShown(showMarkLost)
+    window.markLostButton:SetEnabled(showMarkLost)
   end
   if not entry then
     window.activeItemLabel:SetText("No active loot roll.")
@@ -870,7 +1732,6 @@ local function UpdateActivePanel(self, state, window)
     return
   end
 
-  local session = entry.session
   local link = session and session.itemLink or nil
   local text = GetDisplayedItemText(session)
   window.activeItemLabel:SetText(text or "Unknown Item")
@@ -891,18 +1752,74 @@ local function UpdateActivePanel(self, state, window)
   window.activeIcon:SetTexture(icon)
 
   local alreadyVoted = entry.vote and entry.vote ~= ""
-  UpdateVoteButtons(window, session, alreadyVoted)
-  if alreadyVoted then
+  if isPendingApproval then
+    UpdateVoteButtons(window, session, true)
+    local winnerName = GetPreviewWinnerName(session) or "Unknown"
+    if previewPugMode and session.obtainedConfirmed ~= true then
+      window.activeStatusLabel:SetText("Preview pug mode: waiting for obtained confirmation.")
+      window.activeMessageLabel:SetText("No-addon participants pending. Click Confirm Obtained to resolve pugs.")
+    elseif previewPugMode and session.obtainedConfirmed == true then
+      window.activeStatusLabel:SetText("Winner confirmed: " .. tostring(winnerName))
+      window.activeMessageLabel:SetText("Waiting for addon votes only.")
+    else
+      local winnerRef = session and (session.computedWinnerGuid or (session.computedResult and session.computedResult.winnerKey)) or nil
+      local provider = GetVoteProvider(session)
+      local displayWinner = winnerRef and GetVoterDisplayName(provider, winnerRef) or "Unknown"
+      if not winnerRef then
+        displayWinner = "No computed winner"
+      end
+      window.activeStatusLabel:SetText("Pending admin approval. Computed winner: " .. tostring(displayWinner))
+      if showPendingActions then
+        if previewAdmin and session and session.previewMarkedLost then
+          window.activeMessageLabel:SetText("Preview: item marked lost.")
+        else
+          window.activeMessageLabel:SetText("Confirm obtained (guild/guest only) or mark item lost.")
+        end
+      else
+        window.activeMessageLabel:SetText("Waiting for admin confirmation.")
+      end
+    end
+    window.activeMessageLabel:Show()
+  elseif alreadyVoted then
+    UpdateVoteButtons(window, session, alreadyVoted)
     local voteText = FormatVoteLabel(entry.vote)
     window.activeStatusLabel:SetText("Vote submitted: " .. voteText .. ". Waiting for results.")
     window.activeMessageLabel:SetText("Voted - waiting for winner")
     window.activeMessageLabel:Show()
   else
-    window.activeStatusLabel:SetText("Declare your intent here. Buttons remain enabled until you vote.")
-    if window.needDisabledReasonText then
+    UpdateVoteButtons(window, session, alreadyVoted)
+    if previewAdmin then
+      local votes = BuildSessionVoteSnapshot(session, state, entry.key)
+      local missingKeys = GetPreviewMissingKeys(session, votes)
+      local dismissedCount = CountPreviewDismissedMissing(session, missingKeys)
+      if previewPugMode and session.obtainedConfirmed == true then
+        local addonMissing = GetPreviewMissingAddonDisplay(session, votes)
+        local addonText = FormatMissingDisplayText(addonMissing)
+        window.activeStatusLabel:SetText("Winner: " .. tostring(GetPreviewWinnerName(session) or "Unknown"))
+        if addonText ~= "" then
+          window.activeMessageLabel:SetText("Waiting for addon votes: " .. tostring(addonText))
+        else
+          window.activeMessageLabel:SetText("Winner resolved and all addon votes present.")
+        end
+        window.activeMessageLabel:Show()
+      elseif dismissedCount > 0 then
+        window.activeStatusLabel:SetText("Declare your intent here. Buttons remain enabled until you vote.")
+        window.activeMessageLabel:SetText("Preview: " .. tostring(dismissedCount) .. " pending voters dismissed; use Force Pending.")
+        window.activeMessageLabel:Show()
+      elseif window.needDisabledReasonText then
+        window.activeStatusLabel:SetText("Declare your intent here. Buttons remain enabled until you vote.")
+        window.activeMessageLabel:SetText("Need disabled: " .. tostring(window.needDisabledReasonText))
+        window.activeMessageLabel:Show()
+      else
+        window.activeStatusLabel:SetText("Declare your intent here. Buttons remain enabled until you vote.")
+        window.activeMessageLabel:Hide()
+      end
+    elseif window.needDisabledReasonText then
+      window.activeStatusLabel:SetText("Declare your intent here. Buttons remain enabled until you vote.")
       window.activeMessageLabel:SetText("Need disabled: " .. tostring(window.needDisabledReasonText))
       window.activeMessageLabel:Show()
     else
+      window.activeStatusLabel:SetText("Declare your intent here. Buttons remain enabled until you vote.")
       window.activeMessageLabel:Hide()
     end
   end
@@ -955,12 +1872,44 @@ local function UpdatePendingRows(self, state, window)
     row.itemText:SetWidth(math.max(100, childWidth - statusWidth - 60))
     local entryKey = entry.key
     local votes = BuildSessionVoteSnapshot(session, state, entryKey)
-    local missingNames = GetMissingVotersForSession(session, votes)
+    local previewPugMode = IsAdminPreview(state) and session and session.previewPugMode == true
+    local missingNames = GetPreviewMissingDisplay(session, votes)
+    local addonMissingNames = GetPreviewMissingAddonDisplay(session, votes)
     local hasLocalVoted = HasLocalPlayerVotedSession(session, votes)
+    local status = GetSessionStatus(session)
     row.missingTooltipText = (#missingNames > 0) and table.concat(missingNames, "\n") or nil
 
     local displayText = ""
-    if not hasLocalVoted then
+    if previewPugMode then
+      row.statusText:SetFontObject(GameFontHighlightSmall)
+      row.statusText:SetTextColor(0.9, 0.9, 0.9)
+      if session.obtainedConfirmed == true then
+        local winner = GetPreviewWinnerName(session) or "Unknown"
+        local addonMissingText = FormatMissingDisplayText(addonMissingNames)
+        if addonMissingText == "" then
+          displayText = "Winner: " .. tostring(winner) .. " | Waiting for addon votes: none"
+        else
+          displayText = "Winner: " .. tostring(winner) .. " | Waiting for addon votes: " .. addonMissingText
+        end
+      else
+        local missingText = FormatMissingDisplayText(missingNames)
+        if missingText == "" then
+          displayText = "Waiting for votes"
+        else
+          displayText = "Waiting for votes: " .. missingText
+        end
+      end
+    elseif status == "PENDING_APPROVAL" then
+      row.statusText:SetFontObject(GameFontHighlightSmall)
+      row.statusText:SetTextColor(1, 0.82, 0.2)
+      local winnerRef = session and (session.computedWinnerGuid or (session.computedResult and session.computedResult.winnerKey)) or nil
+      local provider = GetVoteProvider(session)
+      local winnerName = winnerRef and GetVoterDisplayName(provider, winnerRef) or "Unknown"
+      displayText = "Pending admin approval"
+      if winnerRef then
+        displayText = displayText .. ": " .. tostring(winnerName)
+      end
+    elseif not hasLocalVoted then
       row.statusText:SetFontObject(GameFontNormalLarge)
       row.statusText:SetTextColor(0.2, 1, 0.2)
       displayText = "Waiting for your Vote"
@@ -1018,6 +1967,18 @@ local function UpdatePendingRows(self, state, window)
 end
 
 local function UpdateLootWindowContent(self, state, window)
+  if window and window.titleLabel then
+    if state and state.demoMode then
+      if IsAdminPreview(state) then
+        local modeText = state.previewPugMode and "Pug Mode" or "Guild Mode"
+        window.titleLabel:SetText("[PREVIEW] Admin Pending Window (" .. modeText .. ")")
+      else
+        window.titleLabel:SetText("[PREVIEW] Loot Votes (Member)")
+      end
+    else
+      window.titleLabel:SetText("Loot Votes")
+    end
+  end
   UpdateActivePanel(self, state, window)
   UpdatePendingRows(self, state, window)
 end
@@ -1064,10 +2025,17 @@ end
 function UI:RefreshLootWindow(options)
   options = options or {}
   local state = GetLootWindowState(self)
-  local sessions = GetActiveVoteSessions()
-  if #sessions > 0 and not options.forceDemo then
-    state.demoMode = false
+  if not state.demoMode and not IsLootGateActive() then
+    state.currentVoteItems = {}
+    state.indexByKey = {}
+    state.activeKey = nil
+    state.activeIndex = nil
+    if self.lootVoteWindow and self.lootVoteWindow.frame then
+      self.lootVoteWindow.frame:Hide()
+    end
+    return
   end
+  local sessions = GetActiveVoteSessions()
   local displaySessions = state.demoMode and (state.demoItems or {}) or sessions
   BuildVoteEntries(self, displaySessions)
   UpdateActiveSelection(self, state, options)
@@ -1088,6 +2056,12 @@ function UI:RefreshLootWindow(options)
     or state.demoMode
     or (inRaid and #sessions > 0)
   local window = EnsureLootWindow(self)
+  if options.onlyIfPending and not state.demoMode then
+    local alreadyShown = window and window.frame and window.frame.IsShown and window.frame:IsShown()
+    if not alreadyShown then
+      shouldShow = shouldShow and ShouldPromptPendingSessions(self, state, sessions, options)
+    end
+  end
   local blockClose = HasUnvotedEntries(state, state.currentVoteItems)
   if window.closeButton and window.closeButton.SetEnabled then
     window.closeButton:SetEnabled(not blockClose)
@@ -1121,6 +2095,9 @@ function UI:RefreshLootWindow(options)
       window.frame:Raise()
     end
     UpdateLootWindowContent(self, state, window)
+    if not state.demoMode and GLD and GLD.ReapplyCoverBlockersForActiveRolls then
+      GLD:ReapplyCoverBlockersForActiveRolls("ui_refresh", true)
+    end
     if GLD.IsDebugEnabled and GLD:IsDebugEnabled() then
       GLD:Debug("Loot window shown: items=" .. tostring(#state.currentVoteItems))
     end
@@ -1132,54 +2109,305 @@ function UI:RefreshLootWindow(options)
   end
 end
 
-function UI:ShowLootWindowDemo()
+function UI:CloseLootSessionWindows(reason)
   local state = GetLootWindowState(self)
-  state.demoMode = true
-  state.demoVotes = {}
-  state.demoItems = {
-    {
-      rollID = "demo-loot-a",
-      rollKey = "demo-loot-a@demo",
-      itemLink = "item:237728",
-      itemName = "Voidglass Kris",
-      canNeed = true,
-      canGreed = true,
-      canTransmog = true,
-      isTest = true,
-      expectedVoters = { "Lily", "Rob", "Steph", "Alex", "Ryan", "Vulthan", "Mira" },
-      expectedVoterClasses = {
-        Lily = "DRUID",
-        Rob = "SHAMAN",
-        Steph = "HUNTER",
-        Alex = "WARLOCK",
-        Ryan = "DEATHKNIGHT",
-        Vulthan = "WARRIOR",
-        Mira = "MAGE",
-      },
-      votes = {
-        Lily = "NEED",
-        Rob = "GREED",
-      },
-    },
-    {
-      rollID = "demo-loot-b",
-      rollKey = "demo-loot-b@demo",
-      itemLink = "item:244234",
-      itemName = "Astral Gladiator's Prestigious Cloak",
-      canNeed = true,
-      canGreed = true,
-      canTransmog = true,
-      isTest = true,
-      expectedVoters = { "Lily" },
-      expectedVoterClasses = {
-        Lily = "DRUID",
-      },
-      votes = {},
-    },
-  }
-  state.demoVotes["demo-loot-a@demo"] = "NEED"
+  state.currentVoteItems = {}
+  state.indexByKey = {}
   state.activeKey = nil
-  self:RefreshLootWindow({ forceShow = true, forceDemo = true })
+  state.activeIndex = nil
+  state.demoMode = false
+  state.demoItems = {}
+  state.demoVotes = {}
+  state.previewMode = "member"
+  state.previewAuthority = nil
+  state.previewPugMode = false
+  if self.lootVoteWindow and self.lootVoteWindow.frame then
+    self.lootVoteWindow.frame:Hide()
+  end
+  if self.rollFrames then
+    for key, frame in pairs(self.rollFrames) do
+      if frame then
+        if frame.Release then
+          frame:Release()
+        elseif frame.Hide then
+          frame:Hide()
+        end
+      end
+      self.rollFrames[key] = nil
+    end
+  end
+  if self.demoWinnerNotice and self.demoWinnerNotice.Hide then
+    self.demoWinnerNotice:Hide()
+  end
+  if self.previewForceVoteFrame then
+    self.previewForceVoteFrame:Release()
+    self.previewForceVoteFrame = nil
+  end
+  if GLD and GLD.IsDebugEnabled and GLD:IsDebugEnabled() then
+    GLD:Debug("Loot session windows closed: reason=" .. tostring(reason))
+  end
+end
+
+local function BuildExamplePreviewData(mode, pugMode)
+  local previewMode = (mode == "admin") and "admin" or "member"
+  local previewPugMode = previewMode == "admin" and pugMode == true
+  local items = {}
+
+  if previewMode == "admin" and previewPugMode then
+    items = {
+      {
+        rollID = "demo-loot-a",
+        rollKey = "demo-loot-a@demo",
+        itemLink = "item:237728",
+        itemName = "Voidglass Kris",
+        itemTexture = "Interface\\Icons\\INV_Knife_1H_BFA_Dungeon_C_01",
+        itemLevel = 639,
+        itemSlot = "One-Hand Dagger",
+        canNeed = true,
+        canGreed = true,
+        canTransmog = true,
+        isTest = true,
+        status = "ACTIVE",
+        isPugRun = true,
+        previewPugMode = true,
+        previewWinnerName = "Steph",
+        obtainedConfirmed = false,
+        expectedVoters = { "pug-1", "pug-2", "Alex", "Lily", "Rob", "Steph" },
+        expectedVoterClasses = {
+          Lily = "DRUID",
+          Rob = "SHAMAN",
+          Steph = "HUNTER",
+          Alex = "WARLOCK",
+        },
+        previewParticipants = {
+          ["pug-1"] = { isNoAddon = true, label = "pug" },
+          ["pug-2"] = { isNoAddon = true, label = "pug" },
+          Alex = { isAddon = true, label = "Alex" },
+          Lily = { isAddon = true, label = "Lily" },
+          Rob = { isAddon = true, label = "Rob" },
+          Steph = { isAddon = true, label = "Steph" },
+        },
+        votes = {
+          Lily = "NEED",
+          Rob = "GREED",
+          Steph = "NEED",
+        },
+        previewDismissedCandidates = {
+          Alex = true,
+          ["pug-1"] = true,
+          ["pug-2"] = true,
+        },
+      },
+      {
+        rollID = "demo-loot-b",
+        rollKey = "demo-loot-b@demo",
+        itemLink = "item:244234",
+        itemName = "Astral Gladiator's Prestigious Cloak",
+        itemTexture = "Interface\\Icons\\INV_Cape_01",
+        itemLevel = 639,
+        itemSlot = "Back",
+        canNeed = true,
+        canGreed = true,
+        canTransmog = true,
+        isTest = true,
+        status = "ACTIVE",
+        expectedVoters = { "Lily", "Rob", "Alex" },
+        expectedVoterClasses = {
+          Lily = "DRUID",
+          Rob = "SHAMAN",
+          Alex = "WARLOCK",
+        },
+        previewParticipants = {
+          Lily = { isAddon = true, label = "Lily" },
+          Rob = { isAddon = true, label = "Rob" },
+          Alex = { isAddon = true, label = "Alex" },
+        },
+        votes = {
+          Lily = "GREED",
+        },
+      },
+    }
+  elseif previewMode == "admin" then
+    items = {
+      {
+        rollID = "demo-loot-a",
+        rollKey = "demo-loot-a@demo",
+        itemLink = "item:237728",
+        itemName = "Voidglass Kris",
+        itemTexture = "Interface\\Icons\\INV_Knife_1H_BFA_Dungeon_C_01",
+        itemLevel = 639,
+        itemSlot = "One-Hand Dagger",
+        canNeed = true,
+        canGreed = true,
+        canTransmog = true,
+        isTest = true,
+        status = "ACTIVE",
+        expectedVoters = { "Lily", "Rob", "Steph", "Alex" },
+        expectedVoterClasses = {
+          Lily = "DRUID",
+          Rob = "SHAMAN",
+          Steph = "HUNTER",
+          Alex = "WARLOCK",
+        },
+        previewParticipants = {
+          Lily = { isAddon = true, label = "Lily" },
+          Rob = { isAddon = true, label = "Rob" },
+          Steph = { isAddon = true, label = "Steph" },
+          Alex = { isAddon = true, label = "Alex" },
+        },
+        votes = {
+          Lily = "NEED",
+        },
+      },
+      {
+        rollID = "demo-loot-b",
+        rollKey = "demo-loot-b@demo",
+        itemLink = "item:244234",
+        itemName = "Astral Gladiator's Prestigious Cloak",
+        itemTexture = "Interface\\Icons\\INV_Cape_01",
+        itemLevel = 639,
+        itemSlot = "Back",
+        canNeed = true,
+        canGreed = true,
+        canTransmog = true,
+        isTest = true,
+        status = "ACTIVE",
+        expectedVoters = { "Ryan", "Vulthan", "Mira" },
+        expectedVoterClasses = {
+          Ryan = "DEATHKNIGHT",
+          Vulthan = "WARRIOR",
+          Mira = "MAGE",
+        },
+        previewParticipants = {
+          Ryan = { isAddon = true, label = "Ryan" },
+          Vulthan = { isAddon = true, label = "Vulthan" },
+          Mira = { isAddon = true, label = "Mira" },
+        },
+        votes = {
+          Ryan = "GREED",
+        },
+      },
+    }
+  else
+    items = {
+      {
+        rollID = "demo-loot-a",
+        rollKey = "demo-loot-a@demo",
+        itemLink = "item:237728",
+        itemName = "Voidglass Kris",
+        canNeed = true,
+        canGreed = true,
+        canTransmog = true,
+        isTest = true,
+        status = "ACTIVE",
+        expectedVoters = { "Lily", "Rob", "Steph", "Alex" },
+        expectedVoterClasses = {
+          Lily = "DRUID",
+          Rob = "SHAMAN",
+          Steph = "HUNTER",
+          Alex = "WARLOCK",
+        },
+        votes = {
+          Lily = "NEED",
+          Rob = "GREED",
+        },
+      },
+      {
+        rollID = "demo-loot-b",
+        rollKey = "demo-loot-b@demo",
+        itemLink = "item:244234",
+        itemName = "Astral Gladiator's Prestigious Cloak",
+        canNeed = true,
+        canGreed = true,
+        canTransmog = true,
+        isTest = true,
+        status = "ACTIVE",
+        expectedVoters = { "Lily" },
+        expectedVoterClasses = {
+          Lily = "DRUID",
+        },
+        votes = {},
+      },
+    }
+  end
+
+  local demoVotes = {}
+  if previewMode ~= "admin" then
+    demoVotes["demo-loot-a@demo"] = "NEED"
+  end
+
+  return {
+    previewMode = previewMode,
+    previewAuthority = previewMode == "admin" and "admin" or "member",
+    previewPugMode = previewPugMode,
+    demoItems = items,
+    demoVotes = demoVotes,
+  }
+end
+
+function UI:ShowLootWindowDemo(mode, options)
+  if type(mode) == "table" then
+    options = mode
+    mode = options and options.mode
+  end
+  options = options or {}
+  local requestedMode = (mode == "admin") and "admin" or "member"
+  local requestedPugMode = options.pugMode == true
+  if InCombatLockdown and InCombatLockdown() then
+    if GLD and GLD.Print then
+      GLD:Print("Cannot open the example Loot/Pending preview during combat.")
+    end
+    AdminTestLog("ShowExampleLootPendingWindow blocked: in combat mode=" .. tostring(requestedMode))
+    return false
+  end
+
+  local state = GetLootWindowState(self)
+  local payload = BuildExamplePreviewData(requestedMode, requestedPugMode)
+  state.demoMode = true
+  state.previewMode = payload.previewMode
+  state.previewAuthority = payload.previewAuthority
+  state.previewPugMode = payload.previewPugMode == true
+  state.demoVotes = payload.demoVotes or {}
+  state.demoItems = payload.demoItems or {}
+  state.activeKey = nil
+  state.activeIndex = nil
+
+  local liveSessions = GetActiveVoteSessions()
+  if #liveSessions > 0 and GLD and GLD.Print then
+    GLD:Print("Real session active; showing preview mock window only.")
+    AdminTestLog("Real session active; showing preview mock window only.")
+  end
+  if requestedMode == "admin" then
+    AdminTestLog("AdminPreview opened pugMode=" .. tostring(state.previewPugMode == true))
+  else
+    AdminTestLog("ShowExampleLootPendingWindow mode=" .. tostring(requestedMode))
+  end
+
+  local ok, err = pcall(function()
+    self:RefreshLootWindow({ forceShow = true, forceDemo = true })
+  end)
+  if not ok then
+    if GLD and GLD.Print then
+      GLD:Print("Failed to open preview window: " .. tostring(err))
+    end
+    return false
+  end
+  return true
+end
+
+function GLD:ShowExampleLootPendingWindow(mode, pugMode)
+  if not self.UI or not self.UI.ShowLootWindowDemo then
+    return false
+  end
+  return self.UI:ShowLootWindowDemo(mode, { pugMode = pugMode == true })
+end
+
+function GLD:ShowExampleMemberLootPendingWindow()
+  return self:ShowExampleLootPendingWindow("member")
+end
+
+function GLD:ShowExampleAdminLootPendingWindow(pugMode)
+  return self:ShowExampleLootPendingWindow("admin", pugMode)
 end
 
 function UI:ShowDemoWinnerNotice(session)
@@ -1315,8 +2543,17 @@ function UI:HandleLootVote(vote)
   end
 end
 
-function UI:ShowPendingFrame()
-  self:RefreshLootWindow({ forceShow = true })
+function UI:ShowPendingFrame(options)
+  options = options or {}
+  if not IsLootGateActive() then
+    return
+  end
+  self:RefreshLootWindow({
+    forceShow = true,
+    reopen = options.reopen,
+    onlyIfPending = options.onlyIfPending,
+    trigger = options.trigger,
+  })
 end
 
 function UI:RefreshPendingVotes()

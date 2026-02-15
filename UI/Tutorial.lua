@@ -1250,6 +1250,16 @@ function Tutorial:SystemSimEndTutorial()
     end
     UI.resultFrame = nil
   end
+  self:FinishTutorial()
+end
+
+function Tutorial:FinishTutorial()
+  if GLD and GLD.SetTutorialBlockersActive then
+    GLD:SetTutorialBlockersActive(false)
+  end
+  if GLD and GLD.DisableAllBlockers then
+    GLD:DisableAllBlockers("tutorial_finished")
+  end
   self:Stop(true)
 end
 
@@ -1809,10 +1819,13 @@ function Tutorial:StopSystemExplanation()
 end
 
 function Tutorial:Stop(markSeen)
-  if markSeen and GLD and GLD.db and GLD.db.config then
-    GLD.db.config.tutorialSeen = true
-    if GLD.MarkDBChanged then
-      GLD:MarkDBChanged("tutorialSeen")
+  if GLD and GLD.SetTutorialBlockersActive then
+    GLD:SetTutorialBlockersActive(false)
+  end
+  if markSeen and GLD and GLD.GetUIConfig then
+    local ui = GLD:GetUIConfig()
+    if ui then
+      ui.tutorialSeen = true
     end
   end
   self.active = false
@@ -1834,17 +1847,18 @@ function Tutorial:Stop(markSeen)
 end
 
 function Tutorial:Skip()
-  self:Stop(true)
+  self:FinishTutorial()
 end
 
 function Tutorial:MaybeAutoStart()
   if self.active then
     return
   end
-  if not GLD or not GLD.db or not GLD.db.config then
+  if not GLD or not GLD.GetUIConfig then
     return
   end
-  local seen = GLD.db.config.tutorialSeen
+  local ui = GLD:GetUIConfig()
+  local seen = ui and ui.tutorialSeen
   if seen == false or seen == nil then
     self:Start(false)
   end
@@ -1861,7 +1875,8 @@ function Tutorial:Start(force)
     end
     return
   end
-  if not force and GLD and GLD.db and GLD.db.config and GLD.db.config.tutorialSeen then
+  local ui = GLD and GLD.GetUIConfig and GLD:GetUIConfig() or nil
+  if not force and ui and ui.tutorialSeen then
     return
   end
 
@@ -1870,6 +1885,9 @@ function Tutorial:Start(force)
     self:Stop(false)
   end
   self.active = true
+  if GLD and GLD.SetTutorialBlockersActive then
+    GLD:SetTutorialBlockersActive(true)
+  end
   self.elevatedFrames = {}
   self.demoCloakRow = nil
   self.demoCloakSession = nil
@@ -1967,7 +1985,7 @@ function Tutorial:Next()
     step.onNext(self, step)
   end
   if not self.steps or self.currentStep >= #self.steps then
-    self:Stop(true)
+    self:FinishTutorial()
     return
   end
   self:ShowStep(self.currentStep + 1)

@@ -281,6 +281,7 @@ function GLD:RosterRemoveMember(key)
   if not self.db.players[key] then
     return false, "missing_player"
   end
+  local player = self.db.players[key]
 
   if self.RemovePlayerFromDatabase then
     local ok = self:RemovePlayerFromDatabase(key)
@@ -306,6 +307,9 @@ function GLD:RosterRemoveMember(key)
     self.db.session.attended[key] = nil
   end
 
+  if player and self.IsGuestEntry and self:IsGuestEntry(player) and self.RemoveApprovedGuestRecord then
+    self:RemoveApprovedGuestRecord(key, player)
+  end
   self.db.players[key] = nil
 
   if self.CompactQueue then
@@ -337,6 +341,7 @@ function GLD:RemovePlayerFromDatabase(key)
   if not key or not self.db or not self.db.players then
     return false
   end
+  local player = self.db.players[key]
 
   if self.RemoveFromQueue then
     self:RemoveFromQueue(key, true)
@@ -354,6 +359,9 @@ function GLD:RemovePlayerFromDatabase(key)
     self.db.session.attended[key] = nil
   end
 
+  if player and self.IsGuestEntry and self:IsGuestEntry(player) and self.RemoveApprovedGuestRecord then
+    self:RemoveApprovedGuestRecord(key, player)
+  end
   self.db.players[key] = nil
 
   if self.CompactQueue then

@@ -36,15 +36,19 @@ local function EnsureUnitPopupEntry()
   }
 
   UnitPopupButtons[MENU_ACTION_KEY] = {
-    text = "Add as GLD Guest",
+    text = "Add to Raid Database",
     dist = 0,
     func = function(self)
-      if not GLD or not GLD.CanMutateState or not GLD:CanMutateState() then
+      if not GLD or not GLD.CanAccessAdminUI or not GLD:CanAccessAdminUI() then
         return
       end
       local unit = GetUnitFromPopup(self)
       if unit and UnitExists(unit) then
-        GLD:AddGuestFromUnit(unit)
+        if GLD.ApproveGuestFromUnit then
+          GLD:ApproveGuestFromUnit(unit)
+        else
+          GLD:AddGuestFromUnit(unit)
+        end
       end
     end,
   }
@@ -85,7 +89,7 @@ local function EnsureMenuAPIEntry()
   end
 
   Menu.ModifyMenu("UNIT_POPUP", function(_, rootDescription, contextData)
-    if not GLD or not GLD.CanMutateState or not GLD:CanMutateState() then
+    if not GLD or not GLD.CanAccessAdminUI or not GLD:CanAccessAdminUI() then
       return
     end
     local unit = contextData and contextData.unit
@@ -94,8 +98,12 @@ local function EnsureMenuAPIEntry()
     end
     rootDescription:CreateDivider()
     local submenu = rootDescription:CreateButton("GLD")
-    submenu:CreateButton("Add as GLD Guest", function()
-      GLD:AddGuestFromUnit(unit)
+    submenu:CreateButton("Add to Raid Database", function()
+      if GLD.ApproveGuestFromUnit then
+        GLD:ApproveGuestFromUnit(unit)
+      else
+        GLD:AddGuestFromUnit(unit)
+      end
     end)
   end)
 

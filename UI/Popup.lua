@@ -8,12 +8,15 @@ NS.UI = UI
 GLD.UI = UI
 
 local function GetPopupDismissed()
-  if not GLD or not GLD.db then
+  if not GLD or not GLD.GetUIConfig then
     return nil
   end
-  GLD.db.config = GLD.db.config or {}
-  GLD.db.config.popupDismissed = GLD.db.config.popupDismissed or {}
-  return GLD.db.config.popupDismissed
+  local ui = GLD:GetUIConfig()
+  if not ui then
+    return nil
+  end
+  ui.popupDismissed = ui.popupDismissed or {}
+  return ui.popupDismissed
 end
 
 function UI:ShowPopup(title, bodyText, options)
@@ -64,9 +67,6 @@ function UI:ShowPopup(title, bodyText, options)
       local dismissed = GetPopupDismissed()
       if dismissed then
         dismissed[dismissKey] = true
-      end
-      if GLD and GLD.MarkDBChanged then
-        GLD:MarkDBChanged("popup_dismissed")
       end
     end
   end

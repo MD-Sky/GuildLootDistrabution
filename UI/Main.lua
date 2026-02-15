@@ -32,6 +32,9 @@ function GLD:InitUI()
   UI.editRosterEnabled = false
   UI.enableNoteSearch = false
   UI.visibleRows = 18
+  if NS and NS.Debug and NS.Debug.FlushBuffered then
+    NS.Debug:FlushBuffered()
+  end
   if not AceGUI then
     return
   end
@@ -100,6 +103,9 @@ function UI:CreateDebugFrame()
 
   self.debugFrame = frame
   self.debugEditBox = editBox
+  if NS and NS.Debug and NS.Debug.FlushBuffered then
+    NS.Debug:FlushBuffered()
+  end
   self:RefreshDebugLog()
 end
 
@@ -148,6 +154,15 @@ function UI:AppendDebugLine(msg)
   end
 end
 
+function UI:AddDebugLine(msg)
+  self:AppendDebugLine(msg)
+end
+
+function UI:ClearDebugLog()
+  self.debugLines = {}
+  self:RefreshDebugLog()
+end
+
 function UI:RefreshDebugLog()
   if not self.debugEditBox then
     return
@@ -171,6 +186,28 @@ function UI:RefreshMain()
     return
   end
 
+  if GLD.IsDebugEnabled and GLD:IsDebugEnabled() then
+    local sessionEnabled = GLD.IsEnabled and GLD:IsEnabled() or false
+    local sessionActive = GLD.IsSessionActiveLocal and GLD:IsSessionActiveLocal()
+    if sessionActive == nil then
+      sessionActive = GLD.IsSessionActive and GLD:IsSessionActive() or false
+    end
+    local pugsMode = GLD.GetPugsInRaid and GLD:GetPugsInRaid() or false
+    local guestCount = GLD.guestAnchorCandidates and #GLD.guestAnchorCandidates or 0
+    GLD:Debug(
+      "[UIRefresh] sessionEnabled="
+        .. tostring(sessionEnabled)
+        .. " sessionActive="
+        .. tostring(sessionActive)
+        .. " pugsMode="
+        .. tostring(pugsMode)
+        .. " guestCount="
+        .. tostring(guestCount)
+        .. " guestAnchorsVisible="
+        .. tostring(self.guestAnchorsVisible == true)
+    )
+  end
+
   if GLD.UpdateGuestAttendanceFromGroup then
     GLD:UpdateGuestAttendanceFromGroup()
   end
@@ -192,7 +229,7 @@ function UI:RefreshMain()
   end
 
   if self.guestAnchorsVisible and GLD.RefreshGuestAnchors then
-    GLD:RefreshGuestAnchors()
+    GLD:RefreshGuestAnchors("ui_refresh_main")
   end
 
   if GLD.RefreshTable then
@@ -254,6 +291,27 @@ function UI:ShowAdminVotePopup(session, pendingKeys, pendingLabels)
       order[#order + 1] = key
     end
   end
+  if GLD.IsDebugEnabled and GLD:IsDebugEnabled() then
+    local listPreview = {}
+    local cap = math.min(12, #order)
+    for i = 1, cap do
+      local key = order[i]
+      listPreview[#listPreview + 1] = tostring(values[key] or key) .. " [" .. tostring(key) .. "]"
+    end
+    if #order > cap then
+      listPreview[#listPreview + 1] = "...+" .. tostring(#order - cap)
+    end
+    GLD:Debug(
+      "Admin override dropdown options: rollID="
+        .. tostring(session.rollID)
+        .. " item="
+        .. tostring(session.itemLink or session.itemName or "Item")
+        .. " count="
+        .. tostring(#order)
+        .. " options="
+        .. table.concat(listPreview, ", ")
+    )
+  end
   dropdown:SetList(values, order)
   local defaultKey = (pendingKeys and pendingKeys[1]) or forceKey
   if defaultKey and values[defaultKey] then
@@ -301,6 +359,10 @@ local ROSTER_ICON_SIZE = 16
 local ROSTER_HEADER_AREA_HEIGHT = 36
 local ROSTER_BOTTOM_BAR_HEIGHT = 78
 local ROSTER_GUEST_PANEL_HEIGHT = 90
+local GUEST_ANCHOR_ROW_HEIGHT = 20
+local GUEST_ANCHOR_ROW_SIDE_PADDING = 6
+local GUEST_ANCHOR_BUTTON_WIDTH = 150
+local DEBUG_GUEST_ANCHORS = false
 local GUILD_CREST_SIZE = 40
 local GUILD_CREST_RETRY_DELAY = 0.5
 local GUILD_CREST_MAX_RETRIES = 6
@@ -318,6 +380,225 @@ local GUILD_CREST_USE_MASK = true
 local MAIN_FRAME_HORIZONTAL_PADDING = 32 -- 16 left + 16 right margins
 local HEADER_ROW_HORIZONTAL_PADDING = 30 -- 6 left + 24 right margins inside the inset
 local MIN_MAIN_FRAME_WIDTH = 520
+
+local function GetFrameDebugName(frame)
+  if not frame then
+    return "nil"
+  end
+  local name = frame.GetName and frame:GetName()
+  if name and name ~= "" then
+    return name
+  end
+  return tostring(frame)
+end
+
+local function GetTopLevelContainer(frame)
+  local current = frame
+  local guard = 0
+  while current and current.GetParent and guard < 64 do
+    local parent = current:GetParent()
+    if not parent then
+      break
+    end
+    current = parent
+    guard = guard + 1
+  end
+  return current
+end
+
+local function GetFrameRectLTRB(frame)
+  if not frame or not frame.GetRect then
+    return nil, nil, nil, nil
+  end
+  local left, bottom, width, height = frame:GetRect()
+  if not left or not bottom then
+    return nil, nil, nil, nil
+  end
+  local right = left + (width or 0)
+  local top = bottom + (height or 0)
+  return left, right, top, bottom
+end
+
+local function FormatRectLTRB(left, right, top, bottom)
+  if not left or not right or not top or not bottom then
+    return "nil nil nil nil"
+  end
+  return string.format("%.1f %.1f %.1f %.1f", left, right, top, bottom)
+end
+
+local function FormatFramePoint(frame)
+  if not frame or not frame.GetPoint then
+    return "nil"
+  end
+  local point, relativeTo, relativePoint, xOfs, yOfs = frame:GetPoint(1)
+  return string.format(
+    "%s->%s:%s(%.1f,%.1f)",
+    tostring(point or "nil"),
+    GetFrameDebugName(relativeTo),
+    tostring(relativePoint or "nil"),
+    tonumber(xOfs) or 0,
+    tonumber(yOfs) or 0
+  )
+end
+
+local function RectsIntersect(aLeft, aRight, aTop, aBottom, bLeft, bRight, bTop, bBottom)
+  if (not aLeft) or (not aRight) or (not aTop) or (not aBottom) then
+    return false
+  end
+  if (not bLeft) or (not bRight) or (not bTop) or (not bBottom) then
+    return false
+  end
+  return (aLeft < bRight) and (aRight > bLeft) and (aBottom < bTop) and (aTop > bBottom)
+end
+
+local function ForceGuestAnchorsLayoutRefresh(panel, ui, refreshReason, dbg)
+  if not panel then
+    return
+  end
+  if panel.Show then
+    panel:Show()
+  end
+  if panel.scrollFrame and panel.scrollFrame.Show then
+    panel.scrollFrame:Show()
+  end
+  if panel.scrollChild and panel.scrollChild.Show then
+    panel.scrollChild:Show()
+  end
+
+  local guestScrollBox = panel.guestScrollBox or panel.scrollBox or (ui and ui.guestScrollBox) or nil
+  local didFullUpdate = false
+  if guestScrollBox and guestScrollBox.FullUpdate then
+    guestScrollBox:FullUpdate()
+    didFullUpdate = true
+  end
+  if panel.scrollFrame and panel.scrollFrame.FullUpdate then
+    panel.scrollFrame:FullUpdate()
+    didFullUpdate = true
+  end
+  if panel.scrollFrame and panel.scrollFrame.UpdateScrollChildRect then
+    panel.scrollFrame:UpdateScrollChildRect()
+  end
+  if panel.Layout then
+    panel:Layout()
+  end
+  if panel.MarkDirty then
+    panel:MarkDirty()
+  end
+  if panel.scrollChild and panel.scrollChild.Layout then
+    panel.scrollChild:Layout()
+  end
+  if panel.scrollChild and panel.scrollChild.MarkDirty then
+    panel.scrollChild:MarkDirty()
+  end
+  if dbg and dbg.Throttle then
+    dbg:Throttle(
+      "ga_layout_refresh",
+      0.5,
+      "GuestAnchorsUI",
+      "LayoutRefresh reason=%s panel=%s scrollFrame=%s guestScrollBox=%s fullUpdate=%s",
+      tostring(refreshReason or "unspecified"),
+      GetFrameDebugName(panel),
+      GetFrameDebugName(panel.scrollFrame),
+      GetFrameDebugName(guestScrollBox),
+      tostring(didFullUpdate)
+    )
+  end
+end
+
+local function LogGuestAnchorsGeometry(owner, panel, rows, refreshReason, stage, dbg)
+  if not panel then
+    return
+  end
+  local shouldLog = DEBUG_GUEST_ANCHORS or (owner and owner.IsDebugEnabled and owner:IsDebugEnabled())
+  if not shouldLog then
+    return
+  end
+  local scrollFrame = panel.scrollFrame
+  local scrollChild = panel.scrollChild
+  if not scrollFrame or not scrollChild then
+    return
+  end
+  local firstRow = rows and rows[1] or nil
+  local sfWidth = scrollFrame.GetWidth and scrollFrame:GetWidth() or 0
+  local sfHeight = scrollFrame.GetHeight and scrollFrame:GetHeight() or 0
+  local scWidth = scrollChild.GetWidth and scrollChild:GetWidth() or 0
+  local scHeight = scrollChild.GetHeight and scrollChild:GetHeight() or 0
+  local rowWidth = firstRow and firstRow.GetWidth and firstRow:GetWidth() or 0
+  local rowHeight = firstRow and firstRow.GetHeight and firstRow:GetHeight() or 0
+  local sfRect = FormatRectLTRB(GetFrameRectLTRB(scrollFrame))
+  local scRect = FormatRectLTRB(GetFrameRectLTRB(scrollChild))
+  local rowRect = firstRow and FormatRectLTRB(GetFrameRectLTRB(firstRow)) or "nil nil nil nil"
+  local msg = string.format(
+    "[GuestAnchorsSize:%s] reason=%s scrollFrame w=%.1f h=%.1f rect=(%s) scrollChild w=%.1f h=%.1f rect=(%s) firstRow w=%.1f h=%.1f rect=(%s)",
+    tostring(stage or "unknown"),
+    tostring(refreshReason or "unspecified"),
+    tonumber(sfWidth) or 0,
+    tonumber(sfHeight) or 0,
+    sfRect,
+    tonumber(scWidth) or 0,
+    tonumber(scHeight) or 0,
+    scRect,
+    tonumber(rowWidth) or 0,
+    tonumber(rowHeight) or 0,
+    rowRect
+  )
+  if owner and owner.IsDebugEnabled and owner:IsDebugEnabled() then
+    owner:Debug(msg)
+  end
+  if dbg and dbg.Throttle then
+    dbg:Throttle("ga_size_" .. tostring(stage or "unknown"), 0.3, "GuestAnchorsUI", "%s", msg)
+  end
+end
+
+local function SyncGuestAnchorsScrollGeometry(owner, panel, rowCount, rows, refreshReason, dbg)
+  if not panel then
+    return
+  end
+  local scrollFrame = panel.scrollFrame
+  local scrollChild = panel.scrollChild
+  if not scrollFrame or not scrollChild then
+    return
+  end
+
+  if scrollFrame.GetScrollChild and scrollFrame:GetScrollChild() ~= scrollChild then
+    scrollFrame:SetScrollChild(scrollChild)
+  end
+
+  LogGuestAnchorsGeometry(owner, panel, rows, refreshReason, "before", dbg)
+
+  local frameWidth = scrollFrame.GetWidth and scrollFrame:GetWidth() or 0
+  if (not frameWidth) or frameWidth <= 0 then
+    local panelWidth = panel.GetWidth and panel:GetWidth() or 0
+    frameWidth = math.max(1, (tonumber(panelWidth) or 0) - 34)
+  end
+  frameWidth = math.max(1, tonumber(frameWidth) or 1)
+
+  local rowWidth = math.max(1, frameWidth - (2 * GUEST_ANCHOR_ROW_SIDE_PADDING))
+  local contentHeight = math.max(1, (tonumber(rowCount) or 0) * GUEST_ANCHOR_ROW_HEIGHT)
+
+  scrollChild:SetWidth(frameWidth)
+  scrollChild:SetHeight(contentHeight)
+
+  if rows then
+    local visibleCount = math.min(tonumber(rowCount) or 0, #rows)
+    for i = 1, visibleCount do
+      local row = rows[i]
+      if row then
+        row:SetWidth(rowWidth)
+        row:SetHeight(GUEST_ANCHOR_ROW_HEIGHT)
+      end
+    end
+  end
+
+  if scrollFrame.UpdateScrollChildRect then
+    scrollFrame:UpdateScrollChildRect()
+  end
+  if DEBUG_GUEST_ANCHORS and scrollFrame.SetVerticalScroll then
+    scrollFrame:SetVerticalScroll(0)
+  end
+
+  LogGuestAnchorsGeometry(owner, panel, rows, refreshReason, "after", dbg)
+end
 
 local function AddSpecialFrame(name)
   if not name then
@@ -1599,6 +1880,19 @@ function GLD:CreateTable(frame)
     self:InitializeRosterRow(row)
     self:PopulateRosterRow(row, elementData)
   end)
+  if view.SetElementResetter then
+    view:SetElementResetter(function(row)
+      if not row then
+        return
+      end
+      row.data = nil
+      row.rosterKey = nil
+      row.canRemoveHoverHighlight = false
+      if row.SetRemoveHoverHighlighted then
+        row:SetRemoveHoverHighlighted(false)
+      end
+    end)
+  end
   view:SetElementExtent(ROSTER_ROW_HEIGHT)
   ScrollUtil.InitScrollBoxListWithScrollBar(scrollBox, scrollBar, view)
 
@@ -1734,6 +2028,7 @@ function GLD:CreateBottomBar(frame)
   end)
   buttons[#buttons].requiresAuthority = false
   buttons[#buttons].hideWhenNoAuthority = false
+  ui.endSessionBtn = buttons[#buttons]
   buttons[#buttons + 1] = CreateActionButton("Start Session", 100, function()
     RequireAuthorityAccess(function()
       if self.PromptStartSession then
@@ -1746,11 +2041,28 @@ function GLD:CreateBottomBar(frame)
   end)
   buttons[#buttons].requiresAuthority = false
   buttons[#buttons].hideWhenNoAuthority = false
-  buttons[#buttons + 1] = CreateActionButton("Guest Anchors", 110, function()
+  ui.startSessionBtn = buttons[#buttons]
+  buttons[#buttons + 1] = CreateActionButton("Pugs: OFF", 90, function()
     RequireAdminAccess(function()
-      ui.guestAnchorsVisible = not ui.guestAnchorsVisible
+      local nextValue = not (self.GetPugsInRaid and self:GetPugsInRaid())
+      if self.RequestSetPugsInRaid then
+        self:RequestSetPugsInRaid(nextValue)
+      elseif self.SetPugsInRaid then
+        self:SetPugsInRaid(nextValue)
+      end
       ui:RefreshMain()
     end)
+  end)
+  buttons[#buttons].requiresAuthority = false
+  buttons[#buttons].hideWhenNoAuthority = false
+  ui.pugsModeBtn = buttons[#buttons]
+  buttons[#buttons + 1] = CreateActionButton("Guest Anchors", 110, function()
+    if self.CanAccessAdminUI and self:CanAccessAdminUI() then
+      ui.guestAnchorsVisible = not ui.guestAnchorsVisible
+      ui:RefreshMain()
+      return
+    end
+    self:ShowPermissionDeniedPopup()
   end)
   buttons[#buttons].requiresAuthority = false
   buttons[#buttons].hideWhenNoAuthority = false
@@ -1765,8 +2077,8 @@ function GLD:CreateBottomBar(frame)
     previous = button
   end
 
-  ui.adminButtons = { buttons[1], buttons[2], buttons[3], buttons[4], buttons[5] }
-  ui.toggleGuestsBtn = buttons[5]
+  ui.adminButtons = { buttons[1], buttons[2], buttons[3], buttons[4], buttons[5], buttons[6] }
+  ui.toggleGuestsBtn = buttons[6]
 
   return bar
 end
@@ -1780,18 +2092,28 @@ function GLD:CreateGuestPanel(frame)
 
   local title = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
   title:SetPoint("TOPLEFT", panel, "TOPLEFT", 8, -6)
-  title:SetText("Guest Anchors (Non-guild Raid Members)")
+  title:SetText("Guest Anchors (Pending Approval)")
   panel.title = title
 
-  local scrollFrame = CreateFrame("ScrollFrame", nil, panel, "UIPanelScrollFrameTemplate")
+  local scrollFrame = CreateFrame("ScrollFrame", "GuestAnchorsScrollFrame", panel, "UIPanelScrollFrameTemplate")
   scrollFrame:SetPoint("TOPLEFT", panel, "TOPLEFT", 6, -22)
   scrollFrame:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", -28, 6)
-  local scrollChild = CreateFrame("Frame", nil, scrollFrame)
-  scrollChild:SetSize(1, 1)
+  local scrollChild = CreateFrame("Frame", "GuestAnchorsScrollChild", scrollFrame)
+  scrollChild:SetPoint("TOPLEFT", scrollFrame, "TOPLEFT", 0, 0)
+  scrollChild:SetPoint("TOPRIGHT", scrollFrame, "TOPRIGHT", 0, 0)
+  scrollChild:SetHeight(1)
   scrollFrame:SetScrollChild(scrollChild)
+  if DEBUG_GUEST_ANCHORS then
+    local containerBg = scrollFrame:CreateTexture(nil, "BACKGROUND")
+    containerBg:SetAllPoints(scrollFrame)
+    containerBg:SetColorTexture(0, 1, 0, 0.1)
+    panel.debugContainerBg = containerBg
+  end
   panel.scrollFrame = scrollFrame
   panel.scrollChild = scrollChild
+  panel.guestAnchorsScrollChild = scrollChild
   panel.rows = {}
+  panel.pendingApprovalsByKey = {}
 
   return panel
 end
@@ -1848,6 +2170,23 @@ function GLD:UpdateBottomBarPermissions()
   end
   if ui.toggleGuestsBtn and ui.toggleGuestsBtn.SetEnabled then
     ui.toggleGuestsBtn:SetEnabled(canAccessAdmin)
+  end
+  if ui.pugsModeBtn then
+    local enabled = self.GetPugsInRaid and self:GetPugsInRaid()
+    ui.pugsModeBtn:SetText(enabled and "Pugs: ON" or "Pugs: OFF")
+    if ui.pugsModeBtn.SetEnabled then
+      ui.pugsModeBtn:SetEnabled(canAccessAdmin)
+    end
+  end
+  local sessionActive = self.IsSessionActiveLocal and self:IsSessionActiveLocal()
+  if sessionActive == nil then
+    sessionActive = self.IsSessionActive and self:IsSessionActive() or false
+  end
+  if ui.startSessionBtn and ui.startSessionBtn.SetEnabled then
+    ui.startSessionBtn:SetEnabled(canAccessAdmin and not sessionActive)
+  end
+  if ui.endSessionBtn and ui.endSessionBtn.SetEnabled then
+    ui.endSessionBtn:SetEnabled(canAccessAdmin and sessionActive)
   end
   if not canAccessAdmin and ui.guestAnchorsVisible then
     ui.guestAnchorsVisible = false
@@ -1929,7 +2268,9 @@ function GLD:GetDefaultRosterStatusText()
   if entry and entry.queuePos then
     myPos = tostring(entry.queuePos)
   end
-  return "My Position: " .. myPos
+  local pugsMode = self.GetPugsInRaid and self:GetPugsInRaid()
+  local pugsText = pugsMode and "ON" or "OFF"
+  return "My Position: " .. myPos .. "   |   Pugs in raid: " .. pugsText
 end
 
 function GLD:CreateHeaderButtons(headerRow)
@@ -2282,6 +2623,21 @@ function GLD:InitializeRosterRow(row)
   local highlight = row:CreateTexture(nil, "HIGHLIGHT")
   highlight:SetColorTexture(1, 1, 1, 0.08)
   highlight:SetAllPoints(row)
+  row.baseHighlight = highlight
+
+  local removeHoverHighlight = row:CreateTexture(nil, "BACKGROUND")
+  removeHoverHighlight:SetAllPoints(row)
+  removeHoverHighlight:SetColorTexture(0.95, 0.25, 0.25, 0.16)
+  removeHoverHighlight:Hide()
+  row.removeHoverHighlight = removeHoverHighlight
+  row.canRemoveHoverHighlight = false
+  function row:SetRemoveHoverHighlighted(highlighted)
+    if not self.removeHoverHighlight then
+      return
+    end
+    local show = highlighted == true and self.canRemoveHoverHighlight == true
+    self.removeHoverHighlight:SetShown(show)
+  end
   row.cells = {}
   row.editBoxes = {}
 
@@ -2456,6 +2812,14 @@ function GLD:InitializeRosterRow(row)
         end
       end
     end)
+    row.cells.remove:HookScript("OnEnter", function()
+      if row.canRemoveHoverHighlight then
+        row:SetRemoveHoverHighlighted(true)
+      end
+    end)
+    row.cells.remove:HookScript("OnLeave", function()
+      row:SetRemoveHoverHighlighted(false)
+    end)
   end
 
   if row.queuePosBox then
@@ -2595,6 +2959,10 @@ function GLD:PopulateRosterRow(row, data)
   if not data or not row.cells then
     return
   end
+  if row.SetRemoveHoverHighlighted then
+    row:SetRemoveHoverHighlighted(false)
+  end
+  row.canRemoveHoverHighlight = false
   row.data = data
   row.rosterKey = data.rosterKey or data.playerKey
   local cells = row.cells
@@ -2743,8 +3111,10 @@ function GLD:PopulateRosterRow(row, data)
       if cells.remove.SetEnabled then
         cells.remove:SetEnabled(canRemove == true)
       end
+      row.canRemoveHoverHighlight = canRemove == true
     else
       cells.remove:Hide()
+      row.canRemoveHoverHighlight = false
     end
   end
 end
@@ -2838,54 +3208,218 @@ function GLD:RefreshTable()
   end
 end
 
-function GLD:RefreshGuestAnchors()
+local function CreateGuestAnchorRow(panel)
+  local parent = panel and (panel.guestAnchorsScrollChild or panel.scrollChild)
+  local row = CreateFrame("Frame", nil, parent, "GLDGuestAnchorsRowTemplate")
+  row:SetHeight(GUEST_ANCHOR_ROW_HEIGHT)
+  if DEBUG_GUEST_ANCHORS then
+    row.bg = row.bg or row:CreateTexture(nil, "BACKGROUND")
+    row.bg:SetAllPoints(row)
+    row.bg:SetColorTexture(1, 0, 0, 0.2)
+    row.bg:Show()
+  end
+
+  row.icon = row:CreateTexture(nil, "ARTWORK")
+  row.icon:SetSize(16, 16)
+  row.icon:SetPoint("LEFT", row, "LEFT", 0, 0)
+
+  row.name = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+  row.name:SetPoint("LEFT", row.icon, "RIGHT", 6, 0)
+  row.name:SetPoint("RIGHT", row, "RIGHT", -8, 0)
+  row.name:SetJustifyH("LEFT")
+
+  row.addButton = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+  row.addButton:SetSize(GUEST_ANCHOR_BUTTON_WIDTH, 18)
+  row.addButton:SetPoint("RIGHT", row, "RIGHT", -6, 0)
+  row.addButton:SetText("Add to Raid Database")
+  row.addButton:SetFrameLevel(row:GetFrameLevel() + 2)
+  row.name:ClearAllPoints()
+  row.name:SetPoint("LEFT", row.icon, "RIGHT", 6, 0)
+  row.name:SetPoint("RIGHT", row.addButton, "LEFT", -8, 0)
+  row.name:SetJustifyH("LEFT")
+
+  row.hoverTexture = row:CreateTexture(nil, "HIGHLIGHT")
+  row.hoverTexture:SetAllPoints(row)
+  row.hoverTexture:SetColorTexture(1, 1, 1, 0.06)
+  row.hoverTexture:Hide()
+
+  row:EnableMouse(true)
+  row:SetScript("OnEnter", function(self)
+    if self.hoverTexture then
+      self.hoverTexture:Show()
+    end
+  end)
+  row:SetScript("OnLeave", function(self)
+    if self.hoverTexture then
+      self.hoverTexture:Hide()
+    end
+  end)
+
+  return row
+end
+
+function GLD:RefreshGuestAnchors(reason)
+  local dbg = NS and NS.Debug or nil
+  local refreshReason = tostring(reason or "unspecified")
   local ui = self.UI
   local panel = ui and ui.guestPanel
-  if not panel or not panel:IsShown() then
+  local sessionEnabled = self.IsEnabled and self:IsEnabled() or false
+  local sessionActive = self.IsSessionActiveLocal and self:IsSessionActiveLocal()
+  if sessionActive == nil then
+    sessionActive = self.IsSessionActive and self:IsSessionActive() or false
+  end
+  local pugsMode = self.GetPugsInRaid and self:GetPugsInRaid() or false
+  local inCombat = InCombatLockdown and InCombatLockdown() or false
+  local inRaid = IsInRaid and IsInRaid() or false
+  local panelShown = panel and panel.IsShown and panel:IsShown() or false
+  local panelVisible = panel and panel.IsVisible and panel:IsVisible() or false
+  local panelName = GetFrameDebugName(panel)
+  local scrollFrameName = GetFrameDebugName(panel and panel.scrollFrame)
+  local scrollChildName = GetFrameDebugName(panel and panel.scrollChild)
+  local rosterScrollBoxName = GetFrameDebugName(ui and ui.scrollBox)
+  local guestScrollBoxName = GetFrameDebugName(panel and (panel.guestScrollBox or panel.scrollBox))
+
+  if dbg and dbg.Throttle then
+    dbg:Throttle(
+      "ga_refresh_start",
+      0.5,
+      "GA_REFRESH",
+      "reason=%s panelShown=%s inCombat=%s inRaid=%s sessionEnabled=%s sessionActive=%s pugsMode=%s",
+      refreshReason,
+      tostring(panelShown),
+      tostring(inCombat),
+      tostring(inRaid),
+      tostring(sessionEnabled),
+      tostring(sessionActive),
+      tostring(pugsMode)
+    )
+    dbg:Throttle(
+      "ga_refresh_target",
+      0.5,
+      "GuestAnchorsUI",
+      "RefreshTarget reason=%s panel=%s panelShown=%s panelVisible=%s scrollFrame=%s scrollChild=%s guestScrollBox=%s rosterScrollBox=%s",
+      refreshReason,
+      panelName,
+      tostring(panelShown),
+      tostring(panelVisible),
+      scrollFrameName,
+      scrollChildName,
+      guestScrollBoxName,
+      rosterScrollBoxName
+    )
+  end
+  if self.IsDebugEnabled and self:IsDebugEnabled() then
+    self:Debug(
+      "GuestAnchors refresh target: panel="
+        .. tostring(panelName)
+        .. " panelShown="
+        .. tostring(panelShown)
+        .. " panelVisible="
+        .. tostring(panelVisible)
+        .. " scrollFrame="
+        .. tostring(scrollFrameName)
+        .. " scrollChild="
+        .. tostring(scrollChildName)
+        .. " guestScrollBox="
+        .. tostring(guestScrollBoxName)
+        .. " rosterScrollBox="
+        .. tostring(rosterScrollBoxName)
+    )
+  end
+  if not panel then
+    if dbg and dbg.Throttle then
+      dbg:Throttle("ga_refresh_early_no_panel", 2.0, "GA_REFRESH", "earlyReturn reason=%s cause=no_panel", refreshReason)
+    end
+    return
+  end
+  if not panelShown then
+    if dbg and dbg.Throttle then
+      dbg:Throttle("ga_refresh_early_panel_hidden", 1.0, "GA_REFRESH", "earlyReturn reason=%s cause=panel_hidden", refreshReason)
+    end
     return
   end
 
-  local canMutate = self.CanMutateState and self:CanMutateState() or false
-  local existingGuests = {}
-  for key, player in pairs(self.db and self.db.players or {}) do
-    if player and (player.source == "guest" or player.isGuest == true) then
-      existingGuests[key] = true
-    end
+  local isAdminCharacter = self.IsAdminCharacter and self:IsAdminCharacter() or false
+  panel.pendingApprovalsByKey = panel.pendingApprovalsByKey or {}
+  local candidates = self.RebuildGuestAnchorCandidates and self:RebuildGuestAnchorCandidates() or {}
+  local rebuildStats = self._guestAnchorRebuildStats or {}
+  local providerStats = self._guestAnchorProviderStats or {}
+  local realCount = tonumber(providerStats.realCount) or #candidates
+  local simCount = tonumber(providerStats.simCount) or 0
+  local providerCount = tonumber(providerStats.providerCount) or #candidates
+  local simMode = tostring(providerStats.mode or "merge")
+  panel.guestAnchorProviderCount = providerCount
+  panel.guestAnchorRealCount = realCount
+  panel.guestAnchorSimCount = simCount
+  panel.guestAnchorSimMode = simMode
+  if dbg and dbg.Throttle then
+    dbg:Throttle("ga_refresh_candidates", 0.5, "GA_REFRESH", "reason=%s anchorListCount=%d", refreshReason, #candidates)
+    dbg:Throttle(
+      "ga_provider_set",
+      0.5,
+      "GuestAnchorsUI",
+      "ProviderSet count=%d simCount=%d realCount=%d",
+      providerCount,
+      simCount,
+      realCount
+    )
+  end
+  if dbg and dbg.Force and refreshReason:find("SimGuest", 1, true) then
+    dbg:Force("GuestAnchorsUI", "Refresh reason=%s count=%d", refreshReason, #candidates)
   end
 
-  local units = {}
-  local function addUnit(unit)
-    if not UnitExists(unit) or not UnitIsConnected(unit) then
-      return
-    end
-    if UnitIsUnit(unit, "player") then
-      return
-    end
-    if UnitIsInMyGuild and UnitIsInMyGuild(unit) then
-      return
-    end
-    units[#units + 1] = unit
+  if self.IsDebugEnabled and self:IsDebugEnabled() then
+    self:Debug(
+      "GuestAnchors refresh: candidatesFound="
+        .. tostring(rebuildStats.candidatesFound or #candidates)
+        .. " afterFiltering="
+        .. tostring(rebuildStats.afterFiltering or #candidates)
+        .. " rowsProvidedToUI="
+        .. tostring(#candidates)
+        .. " realCount="
+        .. tostring(realCount)
+        .. " simCount="
+        .. tostring(simCount)
+        .. " simMode="
+        .. tostring(simMode)
+        .. " sessionEnabled="
+        .. tostring(sessionEnabled)
+        .. " sessionActive="
+        .. tostring(sessionActive)
+        .. " pugsMode="
+        .. tostring(pugsMode)
+    )
   end
 
-  if IsInRaid() then
-    for i = 1, GetNumGroupMembers() do
-      addUnit("raid" .. i)
-    end
-  end
-
-  local rowHeight = 22
-  if #units == 0 then
+  if #candidates == 0 then
+    panel.guestAnchorProviderCount = 0
     if not panel.emptyLabel then
       panel.emptyLabel = panel.scrollChild:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-      panel.emptyLabel:SetPoint("TOPLEFT", panel.scrollChild, "TOPLEFT", 4, -4)
+      panel.emptyLabel:SetPoint("TOPLEFT", panel.scrollChild, "TOPLEFT", GUEST_ANCHOR_ROW_SIDE_PADDING, -4)
     end
-    panel.emptyLabel:SetText("No non-guild raid members found.")
+    panel.emptyLabel:SetText("No pending guest anchors.")
     panel.emptyLabel:Show()
     for _, row in ipairs(panel.rows) do
       row:Hide()
     end
-    panel.scrollChild:SetHeight(rowHeight)
-    panel.scrollFrame:UpdateScrollChildRect()
+    for key in pairs(panel.pendingApprovalsByKey) do
+      panel.pendingApprovalsByKey[key] = nil
+    end
+    SyncGuestAnchorsScrollGeometry(self, panel, 0, panel.rows, refreshReason, dbg)
+    ForceGuestAnchorsLayoutRefresh(panel, ui, refreshReason, dbg)
+    SyncGuestAnchorsScrollGeometry(self, panel, 0, panel.rows, refreshReason, dbg)
+    if self.IsDebugEnabled and self:IsDebugEnabled() then
+      self:Debug(
+        "GuestAnchors refresh complete: candidatesFound="
+          .. tostring(rebuildStats.candidatesFound or 0)
+          .. " afterFiltering="
+          .. tostring(rebuildStats.afterFiltering or 0)
+          .. " rowsProvidedToUI=0"
+      )
+    end
+    if dbg and dbg.Throttle then
+      dbg:Throttle("ga_refresh_early_empty", 1.0, "GA_REFRESH", "earlyReturn reason=%s cause=empty_candidates", refreshReason)
+    end
     return
   end
 
@@ -2893,46 +3427,69 @@ function GLD:RefreshGuestAnchors()
     panel.emptyLabel:Hide()
   end
 
-  for index, unit in ipairs(units) do
+  local activeApprovalKeys = {}
+  local initialFrameWidth = panel.scrollFrame and panel.scrollFrame.GetWidth and panel.scrollFrame:GetWidth() or 0
+  if (not initialFrameWidth) or initialFrameWidth <= 0 then
+    local panelWidth = panel.GetWidth and panel:GetWidth() or 0
+    initialFrameWidth = math.max(1, (tonumber(panelWidth) or 0) - 34)
+  end
+  initialFrameWidth = math.max(1, tonumber(initialFrameWidth) or 1)
+  local initialRowWidth = math.max(1, initialFrameWidth - (2 * GUEST_ANCHOR_ROW_SIDE_PADDING))
+  if panel.scrollChild and panel.scrollChild.SetWidth then
+    panel.scrollChild:SetWidth(initialFrameWidth)
+  end
+
+  for index, candidate in ipairs(candidates) do
     local row = panel.rows[index]
     if not row then
-      row = CreateFrame("Frame", nil, panel.scrollChild)
-      row:SetHeight(rowHeight)
-      row.icon = row:CreateTexture(nil, "ARTWORK")
-      row.icon:SetSize(16, 16)
-      row.icon:SetPoint("LEFT", row, "LEFT", 4, 0)
-      row.name = row:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-      row.name:SetPoint("LEFT", row.icon, "RIGHT", 6, 0)
-      row.name:SetWidth(200)
-      row.addButton = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
-      row.addButton:SetSize(170, 18)
-      row.addButton:SetPoint("RIGHT", row, "RIGHT", -6, 0)
+      row = CreateGuestAnchorRow(panel)
       panel.rows[index] = row
     end
 
     row:ClearAllPoints()
-    row:SetPoint("TOPLEFT", panel.scrollChild, "TOPLEFT", 0, -((index - 1) * rowHeight))
-    row:SetPoint("RIGHT", panel.scrollChild, "RIGHT", -4, 0)
+    row:SetPoint("TOPLEFT", panel.scrollChild, "TOPLEFT", GUEST_ANCHOR_ROW_SIDE_PADDING, -((index - 1) * GUEST_ANCHOR_ROW_HEIGHT))
+    row:SetWidth(initialRowWidth)
+    row:SetHeight(GUEST_ANCHOR_ROW_HEIGHT)
 
-    local name = UnitName(unit)
-    local classFile = select(2, UnitClass(unit))
-    local isGuest = self.IsGuest and self:IsGuest(unit) or false
-    local displayName = NS:GetPlayerDisplayName(name, isGuest)
+    local unit = candidate.unit
+    local classFile = candidate.classFile
+    local name = candidate.name
+    local realm = candidate.realm
+    local isSimulated = candidate.isSimulated == true
+    local displayName = NS:GetPlayerBaseName(name) or name or "Unknown"
+    if isSimulated then
+      displayName = "[SIMULATED] " .. tostring(displayName)
+    end
     row.name:SetText(displayName)
     local r, g, b = NS:GetClassColor(classFile)
+    if isSimulated then
+      r, g, b = 1, 0.85, 0.3
+    end
     row.name:SetTextColor(r, g, b)
 
-    local playerKey = NS:GetPlayerKeyFromUnit(unit)
-    local inRoster = playerKey and existingGuests[playerKey] or false
-    if row.addButton then
-      row.addButton:SetText(inRoster and "Remove Guest from Roster" or "Add Guest to Roster")
+    local candidateKey = candidate.key
+    local candidateGuid = candidate.guid
+    local fullName = candidate.fullName or (name and realm and (name .. "-" .. realm)) or name
+    local approvalKey = candidateKey or candidateGuid or fullName or displayName
+    local isPendingApproval = approvalKey and panel.pendingApprovalsByKey[approvalKey] == true or false
+    local rowIsAdmin = candidate.isAdmin
+    if rowIsAdmin == nil then
+      rowIsAdmin = isAdminCharacter == true
     end
+    local showButton = candidate.showingButton == nil and (isAdminCharacter == true) or (candidate.showingButton == true)
+    local alreadyApproved = (not isSimulated) and (self.IsApprovedGuestUnit and self:IsApprovedGuestUnit(unit) or false) or false
+    activeApprovalKeys[approvalKey] = true
 
     local unitRef = unit
     local nameRef = name
+    local realmRef = realm
     local displayNameRef = displayName
-    local playerKeyRef = playerKey
-    local inRosterRef = inRoster
+    local candidateKeyRef = candidateKey
+    local candidateGuidRef = candidateGuid
+    local classRef = classFile
+    local fullNameRef = fullName
+    local approvalKeyRef = approvalKey
+    local rowRef = row
 
     if classFile and CLASS_ICON_TCOORDS and CLASS_ICON_TCOORDS[classFile] then
       local coords = CLASS_ICON_TCOORDS[classFile]
@@ -2943,124 +3500,287 @@ function GLD:RefreshGuestAnchors()
       row.icon:SetTexCoord(0, 1, 0, 1)
     end
 
-    if row.addButton and row.addButton.SetEnabled then
-      row.addButton:SetEnabled(canMutate)
-    end
-    row.addButton:SetScript("OnClick", function()
-      if not self.CanMutateState or not self:CanMutateState() then
-        self:ShowPermissionDeniedPopup()
-        return
-      end
-      if inRosterRef then
-        local actor = self:GetUnitFullName("player") or UnitName("player") or "Unknown"
-        local attendance = nil
-        local presentFlag = nil
-        if playerKeyRef and self.db and self.db.players and self.db.players[playerKeyRef] then
-          attendance = self.db.players[playerKeyRef].attendance
-          if attendance ~= nil then
-            local attKey = tostring(attendance):upper()
-            if attKey == "PRESENT" then
-              presentFlag = true
-            elseif attKey == "ABSENT" or attKey == "OFFLINE" then
-              presentFlag = false
-            end
-          end
-        end
-        if self.IsDebugEnabled and self:IsDebugEnabled() then
-          self:Debug(
-            "Guest remove click: actor="
-              .. tostring(actor)
-              .. " target="
-              .. tostring(displayNameRef or nameRef or "?")
-              .. " key="
-              .. tostring(playerKeyRef)
-              .. " attendance="
-              .. tostring(attendance)
-              .. " present="
-              .. tostring(presentFlag)
-          )
-        end
-        local ok = false
-        local reason = nil
-        if not playerKeyRef then
-          reason = "missing_player_key"
-        elseif not self.db or not self.db.players or not self.db.players[playerKeyRef] then
-          reason = "missing_player"
-        else
-          local player = self.db.players[playerKeyRef]
-          local classFile = player and (player.classFile or player.classFileName or player.class)
-          local specName = player and (player.specName or player.spec)
-          local targetName = player and player.name or nameRef
-          if self.RemoveRosterMember then
-            ok, reason = self:RemoveRosterMember(playerKeyRef)
-          else
-            reason = "remove_handler_missing"
-          end
-          if ok then
-            if self.LogAuditEvent then
-              self:LogAuditEvent("REMOVE_MEMBER", {
-                actor = actor,
-                target = targetName,
-                isGuest = true,
-                class = classFile,
-                spec = specName,
-                rosterKey = playerKeyRef,
-              })
-            end
-            if not self.OnRosterChanged then
-              if self.BroadcastSnapshot then
-                self:BroadcastSnapshot(true)
-                if self.IsDebugEnabled and self:IsDebugEnabled() then
-                  self:Debug("Guest remove broadcast: key=" .. tostring(playerKeyRef))
-                end
-              end
-              if self.UI and self.UI.RefreshMain then
-                self.UI:RefreshMain()
-              end
-            end
-          else
-            reason = reason or "remove_failed"
-          end
-        end
-        if self.IsDebugEnabled and self:IsDebugEnabled() then
-          local outcome = ok and "ok" or (reason or "failed")
-          self:Debug(
-            "Guest remove result: actor="
-              .. tostring(actor)
-              .. " target="
-              .. tostring(displayNameRef or nameRef or "?")
-              .. " key="
-              .. tostring(playerKeyRef)
-              .. " result="
-              .. tostring(outcome)
-          )
-        end
+    if row.addButton then
+      row.addButton:SetFrameLevel(row:GetFrameLevel() + 2)
+      if isSimulated then
+        row.addButton:SetText("SIMULATED (No Add)")
+      elseif alreadyApproved then
+        row.addButton:SetText("Already added")
+      elseif isPendingApproval then
+        row.addButton:SetText("Pending...")
       else
-        if self.AddGuestFromUnit then
-          self:AddGuestFromUnit(unitRef)
-        end
-        UI:RefreshMain()
+        row.addButton:SetText("Add to Raid Database")
       end
-    end)
+      if row.addButton.SetEnabled then
+        local canClick = showButton and (not alreadyApproved) and (not isPendingApproval)
+        row.addButton:SetEnabled(canClick)
+      end
+    end
+    if row.hoverTexture then
+      row.hoverTexture:Hide()
+    end
+
+    if row.addButton then
+      row.addButton:SetScript("OnClick", function()
+        if isSimulated then
+          if dbg and dbg.Force then
+            dbg:Force(
+              "GuestAnchorsUI",
+              "SimGuestIgnored name=%s guid=%s reason=ui_click_blocked",
+              tostring(nameRef or displayNameRef or "?"),
+              tostring(candidateGuidRef or "?")
+            )
+          end
+          if self.Print then
+            self:Print("SIMULATED guest entries are UI-only and cannot be approved.")
+          end
+          return
+        end
+        if not self.IsAdminCharacter or not self:IsAdminCharacter() then
+          self:ShowPermissionDeniedPopup()
+          return
+        end
+        if approvalKeyRef and panel.pendingApprovalsByKey[approvalKeyRef] then
+          return
+        end
+        if (not candidateGuidRef or candidateGuidRef == "") and (not nameRef or nameRef == "") then
+          self:Print("Cannot add guest " .. tostring(displayNameRef or "?") .. ": missing GUID and name.")
+          return
+        end
+        if rowRef and rowRef.addButton then
+          rowRef.addButton:SetText("Pending...")
+          if rowRef.addButton.SetEnabled then
+            rowRef.addButton:SetEnabled(false)
+          end
+        end
+        if approvalKeyRef then
+          panel.pendingApprovalsByKey[approvalKeyRef] = true
+        end
+        local ok, reason = false, nil
+        if self.ApproveGuestCandidate then
+          ok, reason = self:ApproveGuestCandidate({
+            unit = unitRef,
+            key = candidateKeyRef,
+            guid = candidateGuidRef,
+            name = nameRef,
+            realm = realmRef,
+            class = classRef,
+            fullName = fullNameRef,
+          })
+        elseif self.AddGuestFromUnit then
+          ok = self:AddGuestFromUnit(unitRef)
+        end
+        if not ok and reason == "already_approved" then
+          if approvalKeyRef then
+            panel.pendingApprovalsByKey[approvalKeyRef] = nil
+          end
+          if rowRef and rowRef.addButton then
+            rowRef.addButton:SetText("Already added")
+            if rowRef.addButton.SetEnabled then
+              rowRef.addButton:SetEnabled(false)
+            end
+          end
+        elseif ok and reason == "requested" then
+          if self.RefreshGuestAnchors then
+            self:RefreshGuestAnchors("approve_requested")
+          end
+        elseif not ok and (reason == "missing_identity" or reason == "missing_key") then
+          if approvalKeyRef then
+            panel.pendingApprovalsByKey[approvalKeyRef] = nil
+          end
+          self:Print("Cannot add guest " .. tostring(displayNameRef or nameRef or "?") .. ": missing GUID/name.")
+          if self.RefreshGuestAnchors then
+            self:RefreshGuestAnchors("approve_missing_identity")
+          end
+        elseif not ok then
+          if approvalKeyRef then
+            panel.pendingApprovalsByKey[approvalKeyRef] = nil
+          end
+          if self.RefreshGuestAnchors then
+            self:RefreshGuestAnchors("approve_failed")
+          end
+        elseif ok and self.RefreshGuestAnchors then
+          if approvalKeyRef then
+            panel.pendingApprovalsByKey[approvalKeyRef] = nil
+          end
+          self:RefreshGuestAnchors("approve_success")
+        end
+        if self.UI and self.UI.RefreshMain then
+          self.UI:RefreshMain()
+        elseif UI and UI.RefreshMain then
+          UI:RefreshMain()
+        end
+        if self.IsDebugEnabled and self:IsDebugEnabled() then
+          self:Debug(
+            "Guest anchor approve click: target="
+              .. tostring(displayNameRef or nameRef or "?")
+              .. " key="
+              .. tostring(candidateKeyRef)
+              .. " guid="
+              .. tostring(candidateGuidRef)
+              .. " result="
+              .. tostring(ok and "ok" or (reason or "failed"))
+          )
+        end
+      end)
+    end
     row:Show()
+    if row.addButton then
+      row.addButton:SetShown(showButton)
+      row.addButton:SetFrameLevel(row:GetFrameLevel() + 2)
+    end
+    if dbg and dbg.Throttle then
+      local parent = row:GetParent()
+      local parentShown = parent and parent.IsShown and parent:IsShown() or false
+      local rowWidth = row.GetWidth and row:GetWidth() or 0
+      local rowHeight = row.GetHeight and row:GetHeight() or 0
+      dbg:Throttle(
+        "ga_row_bind_" .. tostring(index),
+        1.0,
+        "GA_ROW_BIND",
+        "idx=%d name=%s guid=%s isAdmin=%s showBtn=%s parentShown=%s w=%.1f h=%.1f",
+        index,
+        tostring(displayNameRef or nameRef or "?"),
+        tostring(candidateGuidRef or "?"),
+        tostring(rowIsAdmin),
+        tostring(showButton),
+        tostring(parentShown),
+        tonumber(rowWidth) or 0,
+        tonumber(rowHeight) or 0
+      )
+    end
+    if self.IsDebugEnabled and self:IsDebugEnabled() then
+      local buttonShown = row.addButton and row.addButton:IsShown() or false
+      local buttonVisible = row.addButton and row.addButton:IsVisible() or false
+      local buttonAlpha = row.addButton and row.addButton:GetAlpha() or 0
+      local rowShown = row:IsShown()
+      local rowVisible = row:IsVisible()
+      local rowAlpha = row:GetAlpha()
+      local rowEffectiveAlpha = row.GetEffectiveAlpha and row:GetEffectiveAlpha() or rowAlpha
+      local parent = row:GetParent()
+      local parentShown = parent and parent:IsShown() or false
+      local parentVisible = parent and parent.IsVisible and parent:IsVisible() or false
+      local parentEffectiveAlpha = parent and parent.GetEffectiveAlpha and parent:GetEffectiveAlpha() or 0
+      local rowLeft, rowRight, rowTop, rowBottom = GetFrameRectLTRB(row)
+      local parentLeft, parentRight, parentTop, parentBottom = GetFrameRectLTRB(parent)
+      local rectIntersectsParent =
+        RectsIntersect(rowLeft, rowRight, rowTop, rowBottom, parentLeft, parentRight, parentTop, parentBottom)
+      local parentName = GetFrameDebugName(parent)
+      local topLevelName = GetFrameDebugName(GetTopLevelContainer(row))
+      local rowPoint = FormatFramePoint(row)
+      local parentPoint = FormatFramePoint(parent)
+      local rowHeight = row:GetHeight() or 0
+      self:Debug(
+        "GuestAnchorsRow bind: name="
+          .. tostring(displayNameRef or nameRef or "?")
+          .. " isAdmin="
+          .. tostring(rowIsAdmin)
+          .. " showingButton="
+          .. tostring(showButton)
+          .. " buttonShown="
+          .. tostring(buttonShown)
+          .. " buttonVisible="
+          .. tostring(buttonVisible)
+          .. " buttonAlpha="
+          .. tostring(buttonAlpha)
+          .. " rowShown="
+          .. tostring(rowShown)
+          .. " rowVisible="
+          .. tostring(rowVisible)
+          .. " rowAlpha="
+          .. tostring(rowAlpha)
+          .. " rowEffAlpha="
+          .. tostring(rowEffectiveAlpha)
+          .. " parentShown="
+          .. tostring(parentShown)
+          .. " parentVisible="
+          .. tostring(parentVisible)
+          .. " parentEffAlpha="
+          .. tostring(parentEffectiveAlpha)
+          .. " rowHeight="
+          .. tostring(rowHeight)
+      )
+      self:Debug(
+        string.format(
+          "[GuestAnchorsRow] visible row=%s btn=%s parent=%s effAlpha row=%.2f parent=%.2f rect row=(%s) parent=(%s) parentName=%s topContainer=%s intersects=%s rowPoint=%s parentPoint=%s",
+          tostring(rowVisible),
+          tostring(buttonVisible),
+          tostring(parentVisible),
+          tonumber(rowEffectiveAlpha) or 0,
+          tonumber(parentEffectiveAlpha) or 0,
+          FormatRectLTRB(rowLeft, rowRight, rowTop, rowBottom),
+          FormatRectLTRB(parentLeft, parentRight, parentTop, parentBottom),
+          parentName,
+          topLevelName,
+          tostring(rectIntersectsParent),
+          rowPoint,
+          parentPoint
+        )
+      )
+    end
   end
 
-  for i = #units + 1, #panel.rows do
+  for key in pairs(panel.pendingApprovalsByKey) do
+    if not activeApprovalKeys[key] then
+      panel.pendingApprovalsByKey[key] = nil
+    end
+  end
+
+  for i = #candidates + 1, #panel.rows do
     panel.rows[i]:Hide()
   end
 
-  panel.scrollChild:SetHeight(#units * rowHeight + 4)
-  panel.scrollFrame:UpdateScrollChildRect()
+  SyncGuestAnchorsScrollGeometry(self, panel, #candidates, panel.rows, refreshReason, dbg)
+  ForceGuestAnchorsLayoutRefresh(panel, ui, refreshReason, dbg)
+  SyncGuestAnchorsScrollGeometry(self, panel, #candidates, panel.rows, refreshReason, dbg)
+  if self.IsDebugEnabled and self:IsDebugEnabled() then
+    self:Debug(
+      "GuestAnchors refresh complete: candidatesFound="
+        .. tostring(rebuildStats.candidatesFound or #candidates)
+        .. " afterFiltering="
+        .. tostring(rebuildStats.afterFiltering or #candidates)
+        .. " rowsProvidedToUI="
+        .. tostring(#candidates)
+        .. " realCount="
+        .. tostring(realCount)
+        .. " simCount="
+        .. tostring(simCount)
+    )
+  end
 end
 
 function UI:SubmitRollVote(session, vote, advanceTest)
   if not session or not vote then
     return
   end
+  if (not session.isTest) and GLD and GLD.IsEnabled and GLD.IsSessionActive then
+    if not GLD:IsEnabled() or not GLD:IsSessionActive() then
+      return
+    end
+  end
+
+  if GLD and GLD.GetRollStatus then
+    local status = GLD:GetRollStatus(session)
+    if status ~= "ACTIVE" then
+      if status == "PENDING_APPROVAL" then
+        GLD:Print("Voting is closed for this item: pending admin approval.")
+      else
+        GLD:Print("Voting is closed for this item.")
+      end
+      return
+    end
+  end
+  if session.locked then
+    GLD:Print("Voting is closed for this item.")
+    return
+  end
 
   local key = NS:GetPlayerKeyFromUnit("player")
   if not key then
     return
+  end
+  if GLD and GLD.GetRollCandidateKey then
+    key = GLD:GetRollCandidateKey(key) or key
   end
   if GLD and GLD.GetEligibilityForVote then
     local eligible, reason = GLD:GetEligibilityForVote(session, key, vote, { log = true, requireData = true })
@@ -3077,6 +3797,9 @@ function UI:SubmitRollVote(session, vote, advanceTest)
 
   session.votes = session.votes or {}
   session.votes[key] = vote
+  if GLD and GLD.RecordLocalVote then
+    GLD:RecordLocalVote(session, vote)
+  end
 
   if session.isTest and GLD.CheckRollCompletion then
     GLD:CheckRollCompletion(session)
@@ -3109,10 +3832,6 @@ function UI:SubmitRollVote(session, vote, advanceTest)
     GLD:TraceStep("Vote submitted: " .. tostring(vote) .. " for " .. tostring(itemLabel))
   end
 
-  if session.locked then
-    GLD:Print("Result locked. Your vote was recorded but the outcome is final.")
-  end
-
   if advanceTest and NS.TestUI and session.testVoterName and not IsInRaid() then
     NS.TestUI.testVotes = NS.TestUI.testVotes or {}
     NS.TestUI.testVotes[session.testVoterName] = vote
@@ -3126,6 +3845,11 @@ function UI:SubmitRollVote(session, vote, advanceTest)
 end
 
 function UI:ShowRollPopup(session)
+  if session and not session.isTest and GLD and GLD.IsEnabled and GLD.IsSessionActive then
+    if not GLD:IsEnabled() or not GLD:IsSessionActive() then
+      return
+    end
+  end
   if self.mainFrame and self.mainFrame:IsShown() and session and not session.isTest then
     if self.RefreshLootWindow then
       self:RefreshLootWindow()
@@ -3277,7 +4001,7 @@ function UI:ShowRollPopup(session)
       button.frame:SetScript("OnEnter", function()
         if button.gldDisabledReason then
           GameTooltip:SetOwner(button.frame, "ANCHOR_RIGHT")
-          GameTooltip:SetText(button.gldDisabledReason, 1, 0.8, 0, true)
+          GameTooltip:SetText(button.gldDisabledReason, 1, 0.8, 0, 1, true)
           GameTooltip:Show()
         end
       end)
@@ -3573,6 +4297,7 @@ function UI:ShowRollResultPopup(result)
       roll = GLD:GetWinnerRoll(payload)
     end
     local rollText = roll ~= nil and tostring(roll) or "?"
+    local isLost = payload.resolutionReason == "LOST" or payload.rollStatus == "LOST"
 
     local stateLabel = target.gldStateLabel
     local detailLabel = target.gldDetailLabel
@@ -3581,7 +4306,13 @@ function UI:ShowRollResultPopup(result)
     local arrowFS = target.gldArrowFS
     local newPosFS = target.gldNewPosFS
 
-    if isWinner then
+    if isLost then
+      stateLabel:SetText("Item Lost (Void)")
+      stateLabel:SetTextColor(1, 0.5, 0.5)
+      detailLabel:SetText("No queue movement for this item.")
+      oldPosFS:SetTextColor(0.9, 0.9, 0.9)
+      newPosFS:SetTextColor(0.9, 0.9, 0.9)
+    elseif isWinner then
       stateLabel:SetText("Item Claimed!")
       stateLabel:SetTextColor(0.2, 1, 0.2)
       detailLabel:SetText("Winning Roll: " .. rollText)

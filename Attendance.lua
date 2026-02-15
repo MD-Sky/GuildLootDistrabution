@@ -5,6 +5,109 @@ local RAID_STATE_REFRESH_SECONDS = 20
 local LEAVE_ZONE_WARNING_SECONDS = 60
 local START_SESSION_POPUP = "GLD_START_SESSION_CONFIRM"
 local END_SESSION_POPUP = "GLD_END_SESSION_CONFIRM"
+local LOOT_CTRL_DISABLED = "DISABLED"
+local LOOT_CTRL_ENABLING = "ENABLING"
+local LOOT_CTRL_ENABLED = "ENABLED"
+local LOOT_CTRL_DISABLING = "DISABLING"
+
+local function IsLocalAdminAuthority(self, source)
+  if self and self.IsLocalAuthority then
+    local allowed = self:IsLocalAuthority({ source = source })
+    return allowed == true
+  end
+  if self and self.CanAccessAdminUI then
+    return self:CanAccessAdminUI()
+  end
+  return false
+end
+
+local function EnsureLootSessionStore(self)
+  if not self or not self.db then
+    return nil
+  end
+  self.db.lootSession = self.db.lootSession or {}
+  local store = self.db.lootSession
+  if store.sessionActive == nil then
+    store.sessionActive = self.db.session and self.db.session.active == true or false
+  end
+  if store.sessionId == nil and self.db.session then
+    store.sessionId = self.db.session.raidSessionId
+  end
+  if store.pugsInRaid == nil then
+    store.pugsInRaid = self.db.session and self.db.session.pugsInRaid == true or false
+  end
+  if self.shadow then
+    if self.shadow.sessionActive == nil then
+      self.shadow.sessionActive = store.sessionActive == true
+    end
+    if self.shadow.sessionId == nil then
+      self.shadow.sessionId = store.sessionId
+    end
+    if self.shadow.pugsInRaid == nil then
+      self.shadow.pugsInRaid = store.pugsInRaid == true
+    end
+  end
+  if self.db and self.db.session and self.db.session.pugsInRaid == nil then
+    self.db.session.pugsInRaid = store.pugsInRaid == true
+  end
+  return store
+end
+
+local function DeterminePersistedLootSessionState(self)
+  local dbActive = self.db and self.db.session and self.db.session.active == true
+  local shadowActive = self.shadow and self.shadow.sessionActive == true
+  local store = EnsureLootSessionStore(self)
+  local active = dbActive or shadowActive
+
+  local sessionId = nil
+  if dbActive then
+    sessionId = self.db and self.db.session and self.db.session.raidSessionId or nil
+  end
+  if not sessionId and self.shadow and self.shadow.sessionId then
+    sessionId = self.shadow.sessionId
+  end
+  if active and not sessionId and store and store.sessionId then
+    sessionId = store.sessionId
+  end
+  return active, sessionId
+end
+
+local function EnsureLootController(self)
+  self.lootController = self.lootController or {
+    state = LOOT_CTRL_DISABLED,
+    enabled = false,
+    sessionActive = false,
+    sessionId = nil,
+  }
+  return self.lootController
+end
+
+local function DebugSessionStateChange(self, action, reason)
+  if not (self.IsDebugEnabled and self:IsDebugEnabled()) then
+    return
+  end
+  local sessionEnabled = self.IsEnabled and self:IsEnabled() or false
+  local sessionActive = self.IsSessionActiveLocal and self:IsSessionActiveLocal()
+  if sessionActive == nil then
+    sessionActive = self.IsSessionActive and self:IsSessionActive() or false
+  end
+  local pugsMode = self.GetPugsInRaid and self:GetPugsInRaid() or false
+  local revision = self.db and self.db.meta and self.db.meta.revision or 0
+  self:Debug(
+    "[StateChange] action="
+      .. tostring(action or "unknown")
+      .. " reason="
+      .. tostring(reason or "none")
+      .. " sessionEnabled="
+      .. tostring(sessionEnabled)
+      .. " sessionActive="
+      .. tostring(sessionActive)
+      .. " pugsMode="
+      .. tostring(pugsMode)
+      .. " revision="
+      .. tostring(revision)
+  )
+end
 
 function GLD:InitAttendance()
   if not self.db.session then
@@ -16,6 +119,236 @@ function GLD:InitAttendance()
       currentBoss = nil,
       zoneInstanceID = nil,
     }
+  end
+  if not self.lootController then
+    self:InitLootSessionController()
+  end
+end
+
+function GLD:InitLootSessionController()
+  EnsureLootSessionStore(self)
+  local controller = EnsureLootController(self)
+  controller.state = controller.state or LOOT_CTRL_DISABLED
+  controller.enabled = controller.enabled == true
+  controller.sessionActive = controller.sessionActive == true
+  controller.sessionId = controller.sessionId or nil
+end
+
+function GLD:SetLootSessionPersistence(active, sessionId)
+  local controller = EnsureLootController(self)
+  local store = EnsureLootSessionStore(self)
+  active = active == true
+  if store then
+    store.sessionActive = active
+    store.sessionId = active and sessionId or nil
+  end
+  if self.shadow then
+    self.shadow.sessionActive = active
+    self.shadow.sessionId = active and sessionId or nil
+  end
+  controller.sessionActive = active
+  controller.sessionId = active and sessionId or nil
+end
+
+function GLD:GetPugsInRaid()
+  local authority = self.IsAuthority and self:IsAuthority()
+  if authority then
+    return self.db and self.db.session and self.db.session.pugsInRaid == true
+  end
+  if self.shadow and self.shadow.pugsInRaid ~= nil then
+    return self.shadow.pugsInRaid == true
+  end
+  if self.db and self.db.lootSession and self.db.lootSession.pugsInRaid ~= nil then
+    return self.db.lootSession.pugsInRaid == true
+  end
+  return self.db and self.db.session and self.db.session.pugsInRaid == true or false
+end
+
+function GLD:SetPugsInRaidPersistence(enabled)
+  enabled = enabled == true
+  local store = EnsureLootSessionStore(self)
+  if store then
+    store.pugsInRaid = enabled
+  end
+  if self.db and self.db.session then
+    self.db.session.pugsInRaid = enabled
+  end
+  if self.shadow then
+    self.shadow.pugsInRaid = enabled
+  end
+end
+
+function GLD:ApplyPugsInRaidLocal(enabled, reason)
+  self:SetPugsInRaidPersistence(enabled)
+  if self.RefreshLootControllerFromPersistence then
+    self:RefreshLootControllerFromPersistence("PugsMode:" .. tostring(reason or "local"))
+  end
+  if self.ApplyCoverStatesForAllActiveRolls then
+    self:ApplyCoverStatesForAllActiveRolls()
+  end
+  if self.ReapplyCoverBlockersForActiveRolls then
+    self:ReapplyCoverBlockersForActiveRolls("pugs_mode:" .. tostring(reason or "local"), false)
+  end
+  if self.RunLootBootBootstrap then
+    self:RunLootBootBootstrap("pugs_mode:" .. tostring(reason or "local"))
+  end
+  if self.UI and self.UI.RefreshMain then
+    self.UI:RefreshMain()
+  elseif self.UI and self.UI.RefreshLootWindow then
+    self.UI:RefreshLootWindow()
+  end
+  local AceConfigRegistry = LibStub and LibStub("AceConfigRegistry-3.0", true)
+  if AceConfigRegistry then
+    AceConfigRegistry:NotifyChange("GuildLoot")
+  end
+end
+
+function GLD:SetPugsInRaid(enabled, options)
+  options = options or {}
+  enabled = enabled == true
+  if self.DebugAuth then
+    self:DebugAuth("SetPugsInRaid", "Attendance.SetPugsInRaid")
+  end
+  if not options.skipPermission then
+    if not IsLocalAdminAuthority(self, "Attendance.SetPugsInRaid") then
+      self:ShowPermissionDeniedPopup()
+      return false
+    end
+  end
+  local current = self:GetPugsInRaid()
+  if current == enabled then
+    return true
+  end
+  self:ApplyPugsInRaidLocal(enabled, options.reason or "SetPugsInRaid")
+  if self.MarkDBChanged then
+    self:MarkDBChanged("pugs_mode_set")
+  end
+  DebugSessionStateChange(self, "SET_PUGS_MODE", options.reason or "SetPugsInRaid")
+  local actorGuid = options.actorGuid
+  local actor = options.actorName
+  if not actor or actor == "" then
+    actor = self:GetUnitFullName("player") or UnitName("player") or "Unknown"
+  end
+  if not actorGuid or actorGuid == "" then
+    actorGuid = UnitGUID("player")
+  end
+  if self.LogAuditEvent then
+    self:LogAuditEvent("PUGS_MODE_SET", {
+      actor = actor,
+      actorGuid = actorGuid,
+      details = enabled and "ON" or "OFF",
+    })
+  end
+  if self.LilyDebug then
+    self:LilyDebug(
+      string.format(
+        "[PUGS] mode=%s by=%s",
+        enabled and "ON" or "OFF",
+        tostring(actor)
+      )
+    )
+  end
+  if self.BroadcastPugsModeSet and not options.skipBroadcast then
+    self:BroadcastPugsModeSet(enabled, actorGuid)
+  end
+  if self.BroadcastSessionState and options.broadcastSessionState ~= false then
+    self:BroadcastSessionState(true)
+  end
+  return true
+end
+
+function GLD:RequestSetPugsInRaid(enabled)
+  enabled = enabled == true
+  if self:IsAuthority() then
+    return self:SetPugsInRaid(enabled, { reason = "local_toggle" })
+  end
+  if self.RequestAdminAction then
+    return self:RequestAdminAction("SET_PUGS_MODE", { enabled = enabled })
+  end
+  return false
+end
+
+function GLD:IsEnabled()
+  local controller = EnsureLootController(self)
+  local state = controller.state
+  return state == LOOT_CTRL_ENABLING or state == LOOT_CTRL_ENABLED
+end
+
+function GLD:IsSessionActive()
+  local controller = EnsureLootController(self)
+  if controller.sessionActive ~= nil then
+    return controller.sessionActive == true
+  end
+  local active = DeterminePersistedLootSessionState(self)
+  return active == true
+end
+
+function GLD:EnableSession(sessionId, reason, options)
+  options = options or {}
+  self:InitLootSessionController()
+  local controller = EnsureLootController(self)
+  local nextSessionId = sessionId
+    or (self.db and self.db.session and self.db.session.raidSessionId)
+    or (self.shadow and self.shadow.sessionId)
+    or (self.db and self.db.lootSession and self.db.lootSession.sessionId)
+  if controller.state == LOOT_CTRL_ENABLED and controller.sessionActive and controller.sessionId == nextSessionId then
+    return
+  end
+
+  local previousState = controller.state
+  controller.state = LOOT_CTRL_ENABLING
+  controller.enabled = true
+  controller.sessionActive = true
+  controller.sessionId = nextSessionId
+  self:SetLootSessionPersistence(true, nextSessionId)
+
+  if self.OnLootSessionEnabled then
+    self:OnLootSessionEnabled(nextSessionId, reason or "EnableSession", previousState, options)
+  end
+
+  controller.state = LOOT_CTRL_ENABLED
+  controller.enabled = true
+  controller.sessionActive = true
+  controller.sessionId = nextSessionId
+end
+
+function GLD:DisableSession(reason, options)
+  options = options or {}
+  self:InitLootSessionController()
+  local controller = EnsureLootController(self)
+  if controller.state == LOOT_CTRL_DISABLED and controller.sessionActive ~= true then
+    self:SetLootSessionPersistence(false, nil)
+    return
+  end
+
+  local previousState = controller.state
+  controller.state = LOOT_CTRL_DISABLING
+  controller.enabled = false
+  controller.sessionActive = false
+  controller.sessionId = nil
+  self:SetLootSessionPersistence(false, nil)
+
+  if self.OnLootSessionDisabled then
+    self:OnLootSessionDisabled(reason or "DisableSession", previousState, options)
+  end
+
+  controller.state = LOOT_CTRL_DISABLED
+  controller.enabled = false
+  controller.sessionActive = false
+  controller.sessionId = nil
+end
+
+function GLD:RefreshLootControllerFromPersistence(reason, options)
+  self:InitLootSessionController()
+  local active, sessionId = DeterminePersistedLootSessionState(self)
+  if active then
+    self:EnableSession(sessionId, reason or "RefreshLootController", options)
+  else
+    local disableOptions = options or {}
+    if disableOptions.clearActiveRolls == nil then
+      disableOptions.clearActiveRolls = true
+    end
+    self:DisableSession(reason or "RefreshLootController", disableOptions)
   end
 end
 
@@ -59,6 +392,67 @@ function GLD:GetRaidMemberCounts()
   return guildCount, nonGuildCount, total
 end
 
+function GLD:EnsureRaidSessionMeta(session)
+  if not session then
+    return
+  end
+  session.raidId = session.raidId or session.id
+  if session.revision == nil then
+    session.revision = 1
+  end
+end
+
+function GLD:TouchRaidSession(session, reason)
+  if not session then
+    return
+  end
+  self:EnsureRaidSessionMeta(session)
+  session.revision = (tonumber(session.revision) or 0) + 1
+  session.lastUpdatedAt = GetServerTime()
+  if reason and self.IsDebugEnabled and self:IsDebugEnabled() then
+    self:Debug(
+      "History revision bumped: raidId="
+        .. tostring(session.raidId)
+        .. " rev="
+        .. tostring(session.revision)
+        .. " reason="
+        .. tostring(reason)
+    )
+  end
+end
+
+function GLD:GetHistoryAuthorityUnit()
+  if not IsInRaid() then
+    return nil
+  end
+  local leader = nil
+  local assistant = nil
+  local officer = nil
+  for i = 1, GetNumGroupMembers() do
+    local unit = "raid" .. i
+    if UnitExists(unit) and UnitIsConnected(unit) then
+      if UnitIsGroupLeader(unit) then
+        leader = unit
+      end
+      if not assistant and UnitIsGroupAssistant(unit) then
+        assistant = unit
+      end
+      if not officer and self.IsOfficerUnit and self:IsOfficerUnit(unit) then
+        officer = unit
+      end
+    end
+  end
+  return leader or assistant or officer
+end
+
+function GLD:IsHistoryAuthority()
+  local unit = self:GetHistoryAuthorityUnit()
+  if not unit then
+    return false
+  end
+  return UnitIsUnit(unit, "player")
+end
+
 function GLD:PromptStartSession()
   if self.db.session.active then
     return
@@ -67,7 +461,7 @@ function GLD:PromptStartSession()
     self:Print("You must be in a raid to start a session.")
     return
   end
-  if self.CanAccessAdminUI and not self:CanAccessAdminUI() then
+  if not IsLocalAdminAuthority(self, "Attendance.PromptStartSession") then
     self:ShowPermissionDeniedPopup()
     return
   end
@@ -96,7 +490,7 @@ function GLD:PromptEndSession()
   if not self.db.session.active then
     return
   end
-  if self.CanAccessAdminUI and not self:CanAccessAdminUI() then
+  if not IsLocalAdminAuthority(self, "Attendance.PromptEndSession") then
     self:ShowPermissionDeniedPopup()
     return
   end
@@ -169,6 +563,8 @@ function GLD:StartRaidSession()
   local id = tostring(GetServerTime()) .. "-" .. tostring(math.random(1000, 9999))
   local entry = {
     id = id,
+    raidId = id,
+    revision = 1,
     startedAt = GetServerTime(),
     endedAt = nil,
     raidName = instanceName or "Unknown",
@@ -200,18 +596,26 @@ function GLD:StartSession()
     self:Print("You must be in a raid to start a session.")
     return
   end
-  if self.CanAccessAdminUI and not self:CanAccessAdminUI() then
+  if self.DebugAuth then
+    self:DebugAuth("StartSession", "Attendance.StartSession")
+  end
+  if not IsLocalAdminAuthority(self, "Attendance.StartSession") then
     self:ShowPermissionDeniedPopup()
     return
   end
   if self.SetSessionAuthority then
-    self:SetSessionAuthority(UnitGUID("player"), self:GetUnitFullName("player"))
+    self:SetSessionAuthority(UnitGUID("player"), self:GetUnitFullName("player"), 1)
   end
   self.db.session.active = true
+  self.db.session.pugsInRaid = false
   self.db.session.startedAt = GetServerTime()
   self.db.session.attended = {}
   local raidSession = self:StartRaidSession()
   self.db.session.zoneInstanceID = raidSession and raidSession.instanceID or nil
+  if self.EnableSession then
+    self:EnableSession(self.db.session.raidSessionId, "StartSession", { source = "authority" })
+  end
+  self:SetPugsInRaidPersistence(false)
   if self.CancelLeaveZoneTimer then
     self:CancelLeaveZoneTimer()
   end
@@ -234,33 +638,57 @@ function GLD:StartSession()
     self:BroadcastSessionState()
   end
   self:BroadcastSnapshot()
+  if self.UI and self.UI.RefreshMain then
+    self.UI:RefreshMain()
+  end
+  DebugSessionStateChange(self, "START_SESSION", "StartSession")
   self:Print("Session started")
 end
 
-function GLD:EndSession()
-  if not self.db.session.active then
+function GLD:EndSession(options)
+  options = options or {}
+  local sessionActive = self.db.session.active == true
+  if not sessionActive and not options.force then
     return
   end
-  if self.CanAccessAdminUI and not self:CanAccessAdminUI() then
-    self:ShowPermissionDeniedPopup()
-    return
+  if not options.skipPermission then
+    if not IsLocalAdminAuthority(self, "Attendance.EndSession") then
+      self:ShowPermissionDeniedPopup()
+      return
+    end
   end
-  if self.AutoMarkCurrentGroup then
-    self:AutoMarkCurrentGroup()
-  end
-  if self.LogRaidAttendanceAudit then
-    self:LogRaidAttendanceAudit()
-  end
-  if self.LogAuditEvent then
+  if not options.skipRequestLog and self.LilyDebug then
     local actor = self:GetUnitFullName("player") or UnitName("player") or "Unknown"
-    self:LogAuditEvent("SESSION_END", { actor = actor })
+    self:LilyDebug(
+      string.format(
+        "[SESSION] End requested by %s host=%s",
+        tostring(actor),
+        tostring(self:IsAuthority())
+      )
+    )
+  end
+  if not options.skipAudit then
+    if self.AutoMarkCurrentGroup then
+      self:AutoMarkCurrentGroup()
+    end
+    if self.LogRaidAttendanceAudit then
+      self:LogRaidAttendanceAudit()
+    end
+    if self.LogAuditEvent then
+      local actor = self:GetUnitFullName("player") or UnitName("player") or "Unknown"
+      self:LogAuditEvent("SESSION_END", { actor = actor })
+    end
   end
   if self.CancelLeaveZoneTimer then
     self:CancelLeaveZoneTimer()
   end
+  local sessionId = self.db.session.raidSessionId
   self.db.session.active = false
+  self.db.session.pugsInRaid = false
   if self.shadow then
     self.shadow.sessionActive = false
+    self.shadow.sessionId = nil
+    self.shadow.pugsInRaid = false
   end
   if self.ClearSessionAuthority then
     self:ClearSessionAuthority()
@@ -268,20 +696,57 @@ function GLD:EndSession()
   local raidSession = self:GetActiveRaidSession()
   if raidSession then
     raidSession.endedAt = GetServerTime()
+    if self.EnsureRaidSessionMeta then
+      self:EnsureRaidSessionMeta(raidSession)
+    end
+    if self.TouchRaidSession then
+      self:TouchRaidSession(raidSession, "end")
+    end
+  end
+  local revision = raidSession and raidSession.revision or (self.db and self.db.meta and self.db.meta.revision) or 0
+  if not options.skipLog and self.LilyDebug then
+    self:LilyDebug(
+      string.format(
+        "[SESSION] Ending session now. sessionId=%s rev=%s",
+        tostring(sessionId or "nil"),
+        tostring(revision)
+      )
+    )
   end
   self.db.session.raidSessionId = nil
   self.db.session.currentBoss = nil
   self.db.session.zoneInstanceID = nil
+  if self.ResetGuestAnchorCandidates then
+    self:ResetGuestAnchorCandidates("session_end")
+  end
+  self:SetPugsInRaidPersistence(false)
+  if self.DisableSession then
+    self:DisableSession("EndSession", { clearActiveRolls = true })
+  end
   if self.MarkDBChanged then
     self:MarkDBChanged("session_end")
   end
-  if self.BroadcastSessionState then
-    self:BroadcastSessionState(true)
+  DebugSessionStateChange(self, "END_SESSION", "EndSession")
+  if not options.skipBroadcast then
+    if self.BroadcastSessionState then
+      self:BroadcastSessionState(true)
+    end
+    if raidSession and self.BroadcastHistoryEntry then
+      self:BroadcastHistoryEntry(raidSession)
+    end
   end
   if self.UI and self.UI.RefreshHistoryIfOpen then
     self.UI:RefreshHistoryIfOpen()
   end
-  self:BroadcastSnapshot(true)
+  if not options.skipBroadcast then
+    self:BroadcastSnapshot(true)
+  end
+  if not options.skipEndMessage and self.SendEndSessionMessage then
+    self:SendEndSessionMessage(sessionId, revision)
+  end
+  if self.UI and self.UI.RefreshMain then
+    self.UI:RefreshMain()
+  end
   self:Print("Session ended")
 end
 
@@ -323,6 +788,9 @@ function GLD:OnEncounterEnd(_, encounterID, encounterName, difficultyID, groupSi
     encounterName = encounterName,
     killedAt = killedAt,
   }
+  if self.TouchRaidSession then
+    self:TouchRaidSession(raidSession, "boss")
+  end
   if self.UI and self.UI.RefreshHistoryIfOpen then
     self.UI:RefreshHistoryIfOpen()
   end
@@ -339,14 +807,8 @@ function GLD:AutoMarkCurrentGroup()
     local unit = "raid" .. i
     if UnitExists(unit) and UnitIsConnected(unit) then
       local shouldTrack = true
-      if self.IsGuest and self:IsGuest(unit) then
-        local existingPlayer = nil
-        if self.GetDBPlayerForUnit then
-          existingPlayer = select(1, self:GetDBPlayerForUnit(unit))
-        end
-        if not existingPlayer then
-          shouldTrack = false
-        end
+      if self.IsTrackedRaidUnit then
+        shouldTrack = self:IsTrackedRaidUnit(unit)
       end
       if shouldTrack then
         local playerKey, isNew = self:UpsertPlayerFromUnit(unit)
@@ -409,10 +871,22 @@ function GLD:LogRaidAttendanceAudit()
   end
 end
 
-function GLD:OnGroupRosterUpdate()
+function GLD:OnGroupRosterUpdate(event)
+  if event == "PLAYER_GUILD_UPDATE" and self.OnGuildRosterUpdate then
+    self:OnGuildRosterUpdate()
+  end
+  if (event == "PLAYER_ENTERING_WORLD" or event == "PLAYER_GUILD_UPDATE") and self.RequestAuthorityRosterRefresh then
+    self:RequestAuthorityRosterRefresh(event)
+  end
   local _, _, added = nil, nil, nil
   if self.RebuildGroupRoster then
     _, _, added = self:RebuildGroupRoster()
+  end
+  if self.RebuildGuestAnchorCandidates then
+    self:RebuildGuestAnchorCandidates()
+  end
+  if self.EvaluateSessionHost then
+    self:EvaluateSessionHost("roster")
   end
   if self.WelcomeGuestsFromGroup then
     self:WelcomeGuestsFromGroup()
@@ -444,13 +918,10 @@ function GLD:OnGroupRosterUpdate()
 end
 
 function GLD:IsSessionActiveLocal()
-  if self:IsAuthority() then
-    return self.db and self.db.session and self.db.session.active == true
+  if self.IsSessionActive then
+    return self:IsSessionActive()
   end
-  if self.shadow and self.shadow.sessionActive ~= nil then
-    return self.shadow.sessionActive == true
-  end
-  return false
+  return self.db and self.db.session and self.db.session.active == true
 end
 
 function GLD:InitRaidStateTicker()

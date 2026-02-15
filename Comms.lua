@@ -78,6 +78,25 @@ local function DeriveRollKey(self, payload)
   return nil
 end
 
+local function BuildRollResultDedupKey(payload)
+  if not payload then
+    return nil
+  end
+  if payload.resultId and payload.resultId ~= "" then
+    return tostring(payload.resultId)
+  end
+  local rollRef = payload.rollKey or payload.rollID or "unknown"
+  local reason = payload.resolutionReason or payload.rollStatus or payload.resolvedBy or "NORMAL"
+  local winner = payload.approvedWinnerGuid or payload.winnerKey or "none"
+  local resolvedAt = payload.resolvedAt or payload.startedAt or 0
+  return tostring(rollRef) .. ":" .. tostring(reason) .. ":" .. tostring(winner) .. ":" .. tostring(resolvedAt)
+end
+
+local HISTORY_CHUNK_SIZE = 220
+local HISTORY_RESEND_DELAY = 3
+local HISTORY_RESEND_MAX = 3
+local HISTORY_CHUNK_TIMEOUT = 15
+
 function GLD:GetAddonBuildString()
   if NS.BUILD ~= nil then
     return tostring(NS.BUILD)
@@ -129,11 +148,10 @@ function GLD:CanRunAddonAudit()
   if not IsInGuild() then
     return false
   end
-  local _, _, rankIndex = GetGuildInfo("player")
-  if rankIndex == nil then
-    return false
+  if self.IsLocalAuthority then
+    return select(1, self:IsLocalAuthority({ source = "Comms.CanRunAddonAudit" })) == true
   end
-  return rankIndex <= 2
+  return false
 end
 
 function GLD:IsValidAuditSender(sender)
@@ -163,11 +181,11 @@ function GLD:IsAuditQuerySenderAllowed(sender)
   if not ok or not unit then
     return false
   end
-  local _, _, rankIndex = GetGuildInfo(unit)
-  if rankIndex == nil then
-    return false
+  local fullName = self.GetUnitFullName and self:GetUnitFullName(unit) or sender
+  if self.IsAuthorityName then
+    return select(1, self:IsAuthorityName(fullName, { source = "Comms.IsAuditQuerySenderAllowed" })) == true
   end
-  return rankIndex <= 2
+  return false
 end
 
 function GLD:SendAuditMessage(payload)
@@ -524,6 +542,21 @@ function GLD:InitComms()
   self.commHandlers[NS.MSG.ROLL_RESULT] = function(sender, payload)
     self:HandleRollResult(sender, payload)
   end
+  if NS.MSG.ROLL_PENDING_APPROVAL then
+    self.commHandlers[NS.MSG.ROLL_PENDING_APPROVAL] = function(sender, payload)
+      self:HandleRollPendingApproval(sender, payload)
+    end
+  end
+  if NS.MSG.ROLL_APPROVED then
+    self.commHandlers[NS.MSG.ROLL_APPROVED] = function(sender, payload)
+      self:HandleRollApproved(sender, payload)
+    end
+  end
+  if NS.MSG.ROLL_LOST then
+    self.commHandlers[NS.MSG.ROLL_LOST] = function(sender, payload)
+      self:HandleRollLost(sender, payload)
+    end
+  end
   self.commHandlers[NS.MSG.ROLL_ACK] = function(sender, payload)
     self:HandleRollAck(sender, payload)
   end
@@ -539,14 +572,54 @@ function GLD:InitComms()
   self.commHandlers[NS.MSG.FORCE_PENDING] = function(sender, payload)
     self:HandleForcePending(sender, payload)
   end
+  if NS.MSG.HOST_CLAIM then
+    self.commHandlers[NS.MSG.HOST_CLAIM] = function(sender, payload)
+      if self.HandleHostClaim then
+        self:HandleHostClaim(sender, payload)
+      end
+    end
+  end
+  if NS.MSG.REQ_END_SESSION then
+    self.commHandlers[NS.MSG.REQ_END_SESSION] = function(sender, payload, distribution)
+      if self.HandleEndSessionRequest then
+        self:HandleEndSessionRequest(sender, payload, distribution)
+      end
+    end
+  end
+  if NS.MSG.END_SESSION then
+    self.commHandlers[NS.MSG.END_SESSION] = function(sender, payload)
+      if self.HandleEndSessionMessage then
+        self:HandleEndSessionMessage(sender, payload)
+      end
+    end
+  end
   self.commHandlers[NS.MSG.SESSION_STATE] = function(sender, payload)
     self:HandleSessionState(sender, payload)
+  end
+  if NS.MSG.PUGS_MODE_SET then
+    self.commHandlers[NS.MSG.PUGS_MODE_SET] = function(sender, payload)
+      self:HandlePugsModeSet(sender, payload)
+    end
+  end
+  if NS.MSG.GUEST_APPROVED then
+    self.commHandlers[NS.MSG.GUEST_APPROVED] = function(sender, payload)
+      self:HandleGuestApproved(sender, payload)
+    end
   end
   self.commHandlers[NS.MSG.REV_CHECK] = function(sender, payload)
     self:HandleRevisionCheck(sender, payload)
   end
-  self.commHandlers[NS.MSG.ADMIN_REQUEST] = function(sender, payload)
-    self:HandleAdminRequest(sender, payload)
+  self.commHandlers[NS.MSG.ADMIN_REQUEST] = function(sender, payload, distribution)
+    self:HandleAdminRequest(sender, payload, distribution)
+  end
+  self.commHandlers[NS.MSG.HISTORY_DATA] = function(sender, payload)
+    self:HandleHistoryData(sender, payload)
+  end
+  self.commHandlers[NS.MSG.HISTORY_ACK] = function(sender, payload)
+    self:HandleHistoryAck(sender, payload)
+  end
+  self.commHandlers[NS.MSG.HISTORY_REQ] = function(sender, payload)
+    self:HandleHistoryRequest(sender, payload)
   end
   if NS.MSG.NOTICE then
     self.commHandlers[NS.MSG.NOTICE] = function(sender, payload)
@@ -555,10 +628,27 @@ function GLD:InitComms()
   end
 end
 
+function GLD:ResolveCommChannel(channel)
+  local resolved = channel or "RAID"
+  if resolved == "RAID" then
+    if IsInGroup and LE_PARTY_CATEGORY_INSTANCE and IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then
+      return "INSTANCE_CHAT"
+    end
+    if IsInRaid and IsInRaid() then
+      return "RAID"
+    end
+    if IsInGroup and IsInGroup() then
+      return "PARTY"
+    end
+  end
+  return resolved
+end
+
 function GLD:SendCommMessageSafe(msgType, payload, channel, target)
   local message = { type = msgType, payload = payload }
   local serialized = self:Serialize(message)
-  self:SendCommMessage(NS.COMM_PREFIX, serialized, channel or "RAID", target)
+  local resolvedChannel = self.ResolveCommChannel and self:ResolveCommChannel(channel or "RAID") or (channel or "RAID")
+  self:SendCommMessage(NS.COMM_PREFIX, serialized, resolvedChannel, target)
 end
 
 function GLD:OnCommReceived(prefix, message, distribution, sender)
@@ -581,7 +671,7 @@ function GLD:OnCommReceived(prefix, message, distribution, sender)
   end
   local handler = self.commHandlers[data.type]
   if handler then
-    handler(sender, data.payload)
+    handler(sender, data.payload, distribution)
   end
 end
 
@@ -626,11 +716,29 @@ function GLD:HandleStateSnapshot(sender, payload)
   end
   if payload.sessionActive ~= nil then
     self.shadow.sessionActive = payload.sessionActive == true
+    if payload.sessionActive == true then
+      self.shadow.sessionId = payload.sessionId or self.shadow.sessionId
+    else
+      self.shadow.sessionId = nil
+    end
+  end
+  if payload.pugsInRaid ~= nil then
+    if self.SetPugsInRaidPersistence then
+      self:SetPugsInRaidPersistence(payload.pugsInRaid == true)
+    else
+      self.shadow.pugsInRaid = payload.pugsInRaid == true
+    end
   end
   if payload.sessionActive == false and (payload.authorityGUID == nil or payload.authorityGUID == "") then
     if self.ClearSessionAuthority then
       self:ClearSessionAuthority()
     end
+  end
+  if self.RefreshLootControllerFromPersistence then
+    self:RefreshLootControllerFromPersistence("HandleStateSnapshot")
+  end
+  if payload.sessionActive == true and self.MaybeRequestActiveRollSnapshot then
+    self:MaybeRequestActiveRollSnapshot("state_snapshot")
   end
   if self.IsDebugEnabled and self:IsDebugEnabled() then
     local rosterCount = (self.shadow and self.shadow.roster and #self.shadow.roster) or 0
@@ -713,9 +821,27 @@ function GLD:HandleSessionState(sender, payload)
   end
   if payload.sessionActive ~= nil then
     self.shadow.sessionActive = payload.sessionActive == true
+    if payload.sessionActive == true then
+      self.shadow.sessionId = payload.sessionId or self.shadow.sessionId
+    else
+      self.shadow.sessionId = nil
+    end
+  end
+  if payload.pugsInRaid ~= nil then
+    if self.SetPugsInRaidPersistence then
+      self:SetPugsInRaidPersistence(payload.pugsInRaid == true)
+    else
+      self.shadow.pugsInRaid = payload.pugsInRaid == true
+    end
   end
   if payload.sessionActive == false and self.ClearSessionAuthority then
     self:ClearSessionAuthority()
+  end
+  if self.RefreshLootControllerFromPersistence then
+    self:RefreshLootControllerFromPersistence("HandleSessionState")
+  end
+  if payload.sessionActive == true and self.MaybeRequestActiveRollSnapshot then
+    self:MaybeRequestActiveRollSnapshot("session_state")
   end
   if self.UI then
     self.UI:RefreshMain()
@@ -734,12 +860,15 @@ function GLD:BuildSnapshot()
     if not self.db or not self.db.players then
       -- DB not ready yet; return a safe empty snapshot.
       local sessionActive = self.db and self.db.session and self.db.session.active == true
+      local sessionId = self.GetSessionId and self:GetSessionId() or (self.db and self.db.session and self.db.session.raidSessionId)
       return {
         my = my,
         roster = {},
         rosterHash = nil,
         configHash = self:ComputeConfigHash(),
         sessionActive = sessionActive,
+        sessionId = sessionId,
+        pugsInRaid = self.GetPugsInRaid and self:GetPugsInRaid() or false,
         revision = self.db and self.db.meta and self.db.meta.revision or 0,
         lastChanged = self.db and self.db.meta and self.db.meta.lastChanged or 0,
         authorityGUID = self:GetAuthorityGUID(),
@@ -776,6 +905,7 @@ function GLD:BuildSnapshot()
     local sessionActive = self.db and self.db.session and self.db.session.active == true
     local revision = self.db and self.db.meta and self.db.meta.revision or 0
     local lastChanged = self.db and self.db.meta and self.db.meta.lastChanged or 0
+    local sessionId = self.GetSessionId and self:GetSessionId() or (self.db and self.db.session and self.db.session.raidSessionId)
 
   local myKey = NS:GetPlayerKeyFromUnit("player")
   if myKey then
@@ -795,6 +925,8 @@ function GLD:BuildSnapshot()
       rosterHash = rosterHash,
       configHash = configHash,
       sessionActive = sessionActive,
+      sessionId = sessionId,
+      pugsInRaid = self.GetPugsInRaid and self:GetPugsInRaid() or false,
       revision = revision,
       lastChanged = lastChanged,
       authorityGUID = self:GetAuthorityGUID(),
@@ -804,10 +936,13 @@ function GLD:BuildSnapshot()
 
 function GLD:BuildSessionStatePayload()
   local sessionActive = self.db and self.db.session and self.db.session.active == true
+  local sessionId = self.GetSessionId and self:GetSessionId() or (self.db and self.db.session and self.db.session.raidSessionId)
   local revision = self.db and self.db.meta and self.db.meta.revision or 0
   local lastChanged = self.db and self.db.meta and self.db.meta.lastChanged or 0
   return {
     sessionActive = sessionActive,
+    sessionId = sessionId,
+    pugsInRaid = self.GetPugsInRaid and self:GetPugsInRaid() or false,
     revision = revision,
     lastChanged = lastChanged,
     authorityGUID = self:GetAuthorityGUID(),
@@ -842,6 +977,123 @@ function GLD:BroadcastSessionState(force)
   self:SendCommMessageSafe(NS.MSG.SESSION_STATE, payload, "RAID")
 end
 
+function GLD:BroadcastPugsModeSet(enabled, setByGuid)
+  if not self:IsAuthority() then
+    return
+  end
+  if not IsInRaid() then
+    return
+  end
+  local payload = {
+    sessionId = self.GetSessionId and self:GetSessionId() or nil,
+    enabled = enabled == true,
+    setByGuid = setByGuid or UnitGUID("player"),
+    authorityGUID = self:GetAuthorityGUID(),
+    authorityName = self:GetAuthorityName(),
+  }
+  self:SendCommMessageSafe(NS.MSG.PUGS_MODE_SET, payload, "RAID")
+end
+
+function GLD:HandlePugsModeSet(sender, payload)
+  if not payload then
+    return
+  end
+  if self.IsAuthorizedSender then
+    local ok = self:IsAuthorizedSender(sender, payload.authorityGUID, payload.authorityName)
+    if not ok then
+      self:Debug("Blocked unauthorized pugs mode update from " .. tostring(sender))
+      return
+    end
+  end
+  local enabled = payload.enabled == true
+  if self.ApplyPugsInRaidLocal then
+    self:ApplyPugsInRaidLocal(enabled, "comm")
+  elseif self.SetPugsInRaidPersistence then
+    self:SetPugsInRaidPersistence(enabled)
+  else
+    self.shadow.pugsInRaid = enabled
+  end
+  if self.IsDebugEnabled and self:IsDebugEnabled() then
+    self:Debug(
+      "Pugs mode synced: enabled="
+        .. tostring(enabled)
+        .. " sender="
+        .. tostring(sender)
+        .. " setByGuid="
+        .. tostring(payload.setByGuid)
+    )
+  end
+end
+
+function GLD:BroadcastGuestApproved(entry)
+  if not self:IsAuthority() then
+    return
+  end
+  if not IsInRaid() then
+    return
+  end
+  if not entry or not entry.key then
+    return
+  end
+  local payload = {
+    key = entry.key,
+    guid = entry.guid,
+    name = entry.name,
+    realm = entry.realm,
+    class = entry.class,
+    approvedAt = entry.approvedAt,
+    approvedBy = entry.approvedBy,
+    approvedByGuid = entry.approvedByGuid,
+    authorityGUID = self:GetAuthorityGUID(),
+    authorityName = self:GetAuthorityName(),
+  }
+  self:SendCommMessageSafe(NS.MSG.GUEST_APPROVED, payload, "RAID")
+end
+
+function GLD:HandleGuestApproved(sender, payload)
+  if not payload then
+    return
+  end
+  if self.IsAuthorizedSender then
+    local ok = self:IsAuthorizedSender(sender, payload.authorityGUID, payload.authorityName)
+    if not ok then
+      if self.IsDebugEnabled and self:IsDebugEnabled() then
+        self:Debug("Blocked unauthorized guest approval from " .. tostring(sender))
+      end
+      return
+    end
+  end
+  if not self.ApproveGuestCandidate then
+    return
+  end
+  local ok, reason = self:ApproveGuestCandidate({
+    key = payload.key,
+    guid = payload.guid,
+    name = payload.name,
+    realm = payload.realm,
+    class = payload.class,
+    fullName = payload.name and payload.realm and (payload.name .. "-" .. payload.realm) or payload.name,
+  }, {
+    skipPermission = true,
+    skipRequest = true,
+    skipBroadcast = true,
+    silent = true,
+    approvedAt = payload.approvedAt,
+    approvedBy = payload.approvedBy,
+    approvedByGuid = payload.approvedByGuid,
+  })
+  if not ok and reason ~= "already_approved" and self.IsDebugEnabled and self:IsDebugEnabled() then
+    self:Debug(
+      "Guest approval sync failed: sender="
+        .. tostring(sender)
+        .. " key="
+        .. tostring(payload.key)
+        .. " reason="
+        .. tostring(reason)
+    )
+  end
+end
+
 function GLD:SendRevisionCheck()
   if self:IsAuthority() then
     return
@@ -860,6 +1112,9 @@ function GLD:SendRevisionCheck()
 end
 
 function GLD:RequestRollSessionSnapshot(rollKey, rollID)
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
   if self:IsAuthority() then
     return
   end
@@ -883,9 +1138,301 @@ function GLD:RequestRollSessionSnapshot(rollKey, rollID)
   end
 end
 
-function GLD:RequestAdminAction(action)
+function GLD:MaybeRequestActiveRollSnapshot(reason)
+  if self:IsAuthority() then
+    return
+  end
+  if not IsInRaid() then
+    return
+  end
+  if self.IsSessionActive and not self:IsSessionActive() then
+    return
+  end
+  local hasLocalRolls = false
+  for _ in pairs(self.activeRolls or {}) do
+    hasLocalRolls = true
+    break
+  end
+  if hasLocalRolls then
+    return
+  end
+  local now = GetServerTime and GetServerTime() or time()
+  local last = tonumber(self._lastRollSnapshotRequestAt) or 0
+  if last > 0 and (now - last) < 5 then
+    return
+  end
+  self._lastRollSnapshotRequestAt = now
+  self:RequestRollSessionSnapshot(nil, nil)
+  if self.IsDebugEnabled and self:IsDebugEnabled() then
+    self:Debug("Requested active roll snapshot: reason=" .. tostring(reason))
+  end
+end
+
+local ADMIN_REQUEST_THROTTLE_SECONDS = 0.75
+
+local function BuildAdminReqStateLabel(self)
+  local sessionEnabled = self.IsEnabled and self:IsEnabled() or false
+  local sessionActive = self.IsSessionActiveLocal and self:IsSessionActiveLocal()
+  if sessionActive == nil then
+    sessionActive = self.IsSessionActive and self:IsSessionActive() or false
+  end
+  local pugsMode = self.GetPugsInRaid and self:GetPugsInRaid() or false
+  local revision = self.db and self.db.meta and self.db.meta.revision or 0
+  return string.format(
+    "sessionEnabled=%s sessionActive=%s pugsMode=%s revision=%s",
+    tostring(sessionEnabled),
+    tostring(sessionActive),
+    tostring(pugsMode),
+    tostring(revision)
+  )
+end
+
+local function FormatSenderAuth(details)
+  if type(details) ~= "table" then
+    return "unknown"
+  end
+  return string.format(
+    "guid=%s rankIndex=%s rankName=%s authority=%s reason=%s unit=%s",
+    tostring(details.playerGUID or details.guid or "nil"),
+    tostring(details.guildRankIndex or details.rankIndex or "nil"),
+    tostring(details.guildRankName or details.rankName or "nil"),
+    tostring(details.computedAuthority == true),
+    tostring(details.authorityReason or "nil"),
+    tostring(details.unit or "nil")
+  )
+end
+
+local function LogAdminRequestApply(self, action)
+  if self.IsDebugEnabled and self:IsDebugEnabled() then
+    self:Debug("[AdminReqApply] action=" .. tostring(action) .. " newState=" .. BuildAdminReqStateLabel(self))
+  end
+end
+
+local function BuildAdminReqGateLabel(details)
+  if type(details) ~= "table" then
+    return "sessionEnabled=nil sessionActive=nil localAuthority=nil localAuthorityReason=nil elected=nil electedReason=nil authorityGuid=nil dbAuthorityGuid=nil dbAuthorityUnit=nil dbAuthorityName=nil dbAuthorityInRoster=nil sessionId=nil hostRevision=nil"
+  end
+  return string.format(
+    "sessionEnabled=%s sessionActive=%s localAuthority=%s localAuthorityReason=%s elected=%s electedReason=%s authorityGuid=%s dbAuthorityGuid=%s dbAuthorityUnit=%s dbAuthorityName=%s dbAuthorityInRoster=%s dbAuthorityEligible=%s authorityInRoster=%s authorityEligible=%s sessionId=%s hostRevision=%s",
+    tostring(details.sessionEnabled),
+    tostring(details.sessionActive),
+    tostring(details.localAuthority == true),
+    tostring(details.localAuthorityReason or "nil"),
+    tostring(details.elected == true),
+    tostring(details.electedReason or "nil"),
+    tostring(details.authorityGuid or "nil"),
+    tostring(details.dbAuthorityGuid or "nil"),
+    tostring(details.dbAuthorityUnit or "nil"),
+    tostring(details.dbAuthorityName or "nil"),
+    tostring(details.dbAuthorityInRoster == true),
+    tostring(details.dbAuthorityEligible == true),
+    tostring(details.authorityInRoster == true),
+    tostring(details.authorityEligible == true),
+    tostring(details.sessionId or "nil"),
+    tostring(details.hostRevision or "nil")
+  )
+end
+
+local function ResolveAuthorityGuidInRaid(self, guid)
+  if not guid or guid == "" then
+    return nil, nil, false
+  end
+  if not IsInRaid() then
+    return nil, nil, false
+  end
+  local count = GetNumGroupMembers and GetNumGroupMembers() or 0
+  for i = 1, count do
+    local unit = "raid" .. i
+    if UnitExists(unit) and UnitGUID(unit) == guid then
+      local name = self.GetUnitFullName and self:GetUnitFullName(unit) or UnitName(unit)
+      local eligible = self.IsHostEligibleUnit and self:IsHostEligibleUnit(unit) or false
+      return unit, name, eligible
+    end
+  end
+  return nil, nil, false
+end
+
+function GLD:CanProcessAdminRequest(action)
+  local sessionEnabled = self.IsEnabled and self:IsEnabled() or false
+  local sessionActive = self.IsSessionActiveLocal and self:IsSessionActiveLocal()
+  if sessionActive == nil then
+    sessionActive = self.IsSessionActive and self:IsSessionActive() or false
+  end
+  local dbAuthorityGuid = self.db and self.db.session and self.db.session.authorityGUID or nil
+  local gateDetails = {
+    action = action,
+    sessionEnabled = sessionEnabled,
+    sessionActive = sessionActive,
+    localAuthority = false,
+    localAuthorityReason = "not_checked",
+    elected = false,
+    electedReason = "not_checked",
+    authorityGuid = self.GetAuthorityGUID and self:GetAuthorityGUID() or nil,
+    dbAuthorityGuid = dbAuthorityGuid,
+    dbAuthorityUnit = nil,
+    dbAuthorityName = nil,
+    dbAuthorityInRoster = false,
+    dbAuthorityEligible = false,
+    authorityInRoster = false,
+    authorityEligible = false,
+    sessionId = self.GetSessionId and self:GetSessionId() or nil,
+    hostRevision = (self.GetHostRevision and self:GetHostRevision()) or (self.db and self.db.session and self.db.session.hostRevision) or nil,
+  }
+  local authorityProbeGuid = dbAuthorityGuid or gateDetails.authorityGuid
+  if authorityProbeGuid and authorityProbeGuid ~= "" then
+    local probeUnit, probeName, probeEligible = ResolveAuthorityGuidInRaid(self, authorityProbeGuid)
+    gateDetails.dbAuthorityUnit = probeUnit
+    gateDetails.dbAuthorityName = probeName
+    gateDetails.dbAuthorityInRoster = probeUnit ~= nil
+    gateDetails.dbAuthorityEligible = probeEligible == true
+  end
+  if not IsInRaid() then
+    gateDetails.localAuthorityReason = "not_in_raid"
+    gateDetails.electedReason = "not_in_raid"
+    return false, "not_in_raid", gateDetails
+  end
+  if self.IsUnitGuildOfficer then
+    local canAdmin, reason = self:IsUnitGuildOfficer("player")
+    if not canAdmin then
+      gateDetails.localAuthority = false
+      gateDetails.localAuthorityReason = reason or "local_no_admin_access"
+      gateDetails.electedReason = "blocked_local_authority"
+      if reason == "not_in_guild" then
+        if self.DebugOfficerAuthority then
+          self:DebugOfficerAuthority("admin_denied reason=%s", "not in guild")
+        end
+        return false, "not in guild", gateDetails
+      end
+      if reason == "not_officer" then
+        if self.DebugOfficerAuthority then
+          self:DebugOfficerAuthority("admin_denied reason=%s", "not officer")
+        end
+        return false, "not officer", gateDetails
+      end
+      if self.DebugOfficerAuthority then
+        self:DebugOfficerAuthority("admin_denied reason=%s", "local no admin access")
+      end
+      return false, "local no admin access", gateDetails
+    else
+      gateDetails.localAuthority = true
+      gateDetails.localAuthorityReason = reason or "officer"
+    end
+  elseif not (self.CanAccessAdminUI and self:CanAccessAdminUI()) then
+    gateDetails.localAuthority = false
+    gateDetails.localAuthorityReason = "can_access_admin_ui_false"
+    gateDetails.electedReason = "blocked_local_authority"
+    if self.DebugOfficerAuthority then
+      self:DebugOfficerAuthority("admin_denied reason=%s", "local no admin access")
+    end
+    return false, "local no admin access", gateDetails
+  else
+    gateDetails.localAuthority = true
+    gateDetails.localAuthorityReason = "can_access_admin_ui_true"
+  end
+  if self:IsAuthority() then
+    gateDetails.elected = true
+    gateDetails.electedReason = "session_authority"
+    return true, "session_authority", gateDetails
+  end
+  local authorityGuid = gateDetails.authorityGuid
+  if authorityGuid and authorityGuid ~= "" then
+    local authorityUnit, authorityName, authorityEligible = ResolveAuthorityGuidInRaid(self, authorityGuid)
+    gateDetails.authorityInRoster = authorityUnit ~= nil
+    gateDetails.authorityEligible = authorityEligible == true
+    if authorityUnit and (not gateDetails.dbAuthorityGuid or gateDetails.dbAuthorityGuid == authorityGuid) then
+      gateDetails.dbAuthorityUnit = authorityUnit
+      gateDetails.dbAuthorityName = authorityName
+      gateDetails.dbAuthorityInRoster = true
+      gateDetails.dbAuthorityEligible = authorityEligible == true
+    end
+
+    -- Safety: never evict while an active session is running, and only evict when
+    -- the authority GUID cannot be resolved to any in-raid unit.
+    local shouldEvictStaleAuthority = sessionActive ~= true
+      and (sessionActive == false or sessionEnabled == false)
+      and authorityUnit == nil
+    if shouldEvictStaleAuthority and self.ClearSessionAuthority then
+      self:ClearSessionAuthority("stale_authority_not_in_group")
+      gateDetails.electedReason = "stale_authority_evicted"
+      gateDetails.authorityGuid = self.GetAuthorityGUID and self:GetAuthorityGUID() or nil
+      gateDetails.dbAuthorityGuid = self.db and self.db.session and self.db.session.authorityGUID or nil
+      gateDetails.dbAuthorityUnit = nil
+      gateDetails.dbAuthorityName = nil
+      gateDetails.dbAuthorityInRoster = false
+      gateDetails.dbAuthorityEligible = false
+      authorityGuid = gateDetails.authorityGuid
+    end
+  end
+  if authorityGuid and authorityGuid ~= "" then
+    gateDetails.elected = false
+    gateDetails.electedReason = "authority_exists"
+    return false, "not_session_authority", gateDetails
+  end
+  local receiverUnit = nil
+  local receiverSource = nil
+  if self.GetBestSessionHostCandidate then
+    local candidate = self:GetBestSessionHostCandidate()
+    receiverUnit = candidate and candidate.unit or nil
+    if receiverUnit then
+      receiverSource = "best_candidate"
+    end
+  end
+  if not receiverUnit and self.GetHistoryAuthorityUnit then
+    receiverUnit = self:GetHistoryAuthorityUnit()
+    if receiverUnit then
+      receiverSource = "history_authority"
+    end
+  end
+  if receiverUnit and UnitExists(receiverUnit) and UnitIsUnit(receiverUnit, "player") then
+    gateDetails.elected = true
+    gateDetails.electedReason = (receiverSource or "candidate") .. "_self"
+    return true, "fallback_elected", gateDetails
+  end
+  gateDetails.elected = false
+  if receiverUnit and UnitExists(receiverUnit) then
+    gateDetails.electedReason = (receiverSource or "candidate") .. "_other"
+  elseif receiverUnit then
+    gateDetails.electedReason = (receiverSource or "candidate") .. "_missing_unit"
+  else
+    gateDetails.electedReason = "no_candidate"
+  end
+  return false, "fallback_not_elected", gateDetails
+end
+
+function GLD:EnsureAuthorityForAdminAction(action)
+  if self:IsAuthority() then
+    return true, "already_authority"
+  end
+  local authorityGuid = self.GetAuthorityGUID and self:GetAuthorityGUID() or nil
+  if authorityGuid and authorityGuid ~= "" then
+    return false, "authority_exists"
+  end
+  local myGuid = UnitGUID("player")
+  if not myGuid or myGuid == "" then
+    return false, "missing_player_guid"
+  end
+  local myName = self.GetUnitFullName and self:GetUnitFullName("player") or UnitName("player") or "Unknown"
+  local revision = self.NextHostRevision and self:NextHostRevision() or 1
+  if self.ApplyHostClaim then
+    self:ApplyHostClaim(revision, myGuid, myName, "admin_request:" .. tostring(action))
+  elseif self.SetSessionAuthority then
+    self:SetSessionAuthority(myGuid, myName, revision)
+  end
+  if self.BroadcastHostClaim then
+    self:BroadcastHostClaim(revision, myGuid, myName, self.GetSessionId and self:GetSessionId() or nil)
+  end
+  if self:IsAuthority() then
+    return true, "claimed_host"
+  end
+  return false, "claim_failed"
+end
+
+function GLD:RequestAdminAction(action, data)
   if not action or action == "" then
     return false
+  end
+  if self.DebugAuth then
+    self:DebugAuth("RequestAdminAction:" .. tostring(action), "Comms.RequestAdminAction")
   end
   if self:IsAuthority() then
     if action == "START_SESSION" and self.StartSession then
@@ -904,6 +1451,30 @@ function GLD:RequestAdminAction(action)
       end
       return true
     end
+    if action == "SET_PUGS_MODE" and self.SetPugsInRaid then
+      local enabled = data and data.enabled == true
+      return self:SetPugsInRaid(enabled, { reason = "admin_request_local", skipPermission = true }) == true
+    end
+    if action == "APPROVE_GUEST" and self.ApproveGuestCandidate then
+      local candidate = {
+        key = data and data.key,
+        guid = data and data.guid,
+        name = data and data.name,
+        realm = data and data.realm,
+        class = data and data.class,
+        fullName = data and data.fullName,
+      }
+      return self:ApproveGuestCandidate(candidate, {
+        skipPermission = true,
+        skipRequest = true,
+      }) == true
+    end
+    if action == "ROLL_CONFIRM_OBTAINED" and self.ConfirmPendingRoll then
+      return self:ConfirmPendingRoll(data and data.rollKey, data and data.approvedWinnerGuid, { skipPermission = true, requestSource = "local" }) == true
+    end
+    if action == "ROLL_MARK_LOST" and self.MarkPendingRollLost then
+      return self:MarkPendingRollLost(data and data.rollKey, { skipPermission = true, requestSource = "local" }) == true
+    end
     return false
   end
   if not IsInRaid() then
@@ -914,14 +1485,187 @@ function GLD:RequestAdminAction(action)
     self:ShowPermissionDeniedPopup()
     return false
   end
-  self:SendCommMessageSafe(NS.MSG.ADMIN_REQUEST, {
-    action = action,
-    requestedAt = GetServerTime(),
-  }, "RAID")
+  local now = (GetTime and GetTime()) or (GetServerTime and GetServerTime()) or time()
+  self._adminRequestCooldownUntil = self._adminRequestCooldownUntil or {}
+  local cooldownUntil = tonumber(self._adminRequestCooldownUntil[action]) or 0
+  if now < cooldownUntil then
+    if self.IsDebugEnabled and self:IsDebugEnabled() then
+      self:Debug(
+        string.format(
+          "[AdminReqSent] action=%s throttled=1 wait=%.2f",
+          tostring(action),
+          tonumber(cooldownUntil - now) or 0
+        )
+      )
+    end
+    return true
+  end
+  local sendChannel = self.ResolveCommChannel and self:ResolveCommChannel("RAID") or "RAID"
+  if action == "END_SESSION" and self.LilyDebug then
+    local actor = self:GetUnitFullName("player") or UnitName("player") or "Unknown"
+    self:LilyDebug(
+      string.format(
+        "[SESSION] End requested by %s host=%s",
+        tostring(actor),
+        tostring(self:IsAuthority())
+      )
+    )
+  end
+  if action == "END_SESSION" and NS.MSG.REQ_END_SESSION then
+    self:SendCommMessageSafe(NS.MSG.REQ_END_SESSION, {
+      sessionId = self.GetSessionId and self:GetSessionId() or nil,
+      requestedAt = GetServerTime(),
+    }, "RAID")
+  else
+    self:SendCommMessageSafe(NS.MSG.ADMIN_REQUEST, {
+      action = action,
+      data = data,
+      requestedAt = GetServerTime(),
+    }, "RAID")
+  end
+  self._adminRequestCooldownUntil[action] = now + ADMIN_REQUEST_THROTTLE_SECONDS
   if self.IsDebugEnabled and self:IsDebugEnabled() then
+    self:Debug("[AdminReqSent] action=" .. tostring(action) .. " channel=" .. tostring(sendChannel))
     self:Debug("Admin request sent: action=" .. tostring(action))
   end
   return true
+end
+
+function GLD:SendEndSessionMessage(sessionId, revision)
+  if not IsInRaid() then
+    return
+  end
+  if not self.SendCommMessageSafe then
+    return
+  end
+  local payload = {
+    sessionId = sessionId,
+    revision = revision,
+    hostGUID = self.GetAuthorityGUID and self:GetAuthorityGUID() or nil,
+    hostName = self.GetAuthorityName and self:GetAuthorityName() or nil,
+  }
+  self:SendCommMessageSafe(NS.MSG.END_SESSION, payload, "RAID")
+end
+
+function GLD:HandleEndSessionRequest(sender, payload, distribution)
+  if self.IsDebugEnabled and self:IsDebugEnabled() then
+    self:Debug(
+      "[AdminReqRecv] action=END_SESSION sender="
+        .. tostring(sender)
+        .. " channel="
+        .. tostring(distribution or "UNKNOWN")
+    )
+  end
+  local canProcess, processReason, gateDetails = self:CanProcessAdminRequest("END_SESSION")
+  if not canProcess then
+    if self.IsDebugEnabled and self:IsDebugEnabled() then
+      self:Debug(
+        "[AdminReqGate] action=END_SESSION sender="
+          .. tostring(sender)
+          .. " decision=deny reason="
+          .. tostring(processReason)
+          .. " "
+          .. BuildAdminReqGateLabel(gateDetails)
+      )
+      self:Debug(
+        "[AdminReqReject] action=END_SESSION sender="
+          .. tostring(sender)
+          .. " reason="
+          .. tostring(processReason)
+          .. " neededAuth=local_authority_or_elected"
+          .. " "
+          .. BuildAdminReqGateLabel(gateDetails)
+      )
+    end
+    return
+  end
+  local ok, reason, authDetails = true, nil, nil
+  if self.ValidateAdminRequestSender then
+    ok, reason, authDetails = self:ValidateAdminRequestSender(sender, "END_SESSION")
+  end
+  if not ok then
+    local label = reason or "rejected"
+    self:Print("End session request rejected from " .. tostring(sender) .. ": " .. tostring(label))
+    if self.IsDebugEnabled and self:IsDebugEnabled() then
+      self:Debug(
+        "[AdminReqReject] action=END_SESSION sender="
+          .. tostring(sender)
+          .. " reason="
+          .. tostring(label)
+          .. " neededAuth=authority_manager"
+          .. " senderAuth="
+          .. FormatSenderAuth(authDetails)
+      )
+    end
+    return
+  end
+  if self.IsDebugEnabled and self:IsDebugEnabled() then
+    self:Debug(
+      "[AdminReqAccept] action=END_SESSION sender="
+        .. tostring(sender)
+        .. " senderAuth="
+        .. FormatSenderAuth(authDetails)
+        .. " processor="
+        .. tostring(processReason)
+    )
+  end
+  if not self:IsAuthority() then
+    local claimed, claimReason = self:EnsureAuthorityForAdminAction("END_SESSION")
+    if not claimed then
+      if self.IsDebugEnabled and self:IsDebugEnabled() then
+        self:Debug(
+          "[AdminReqReject] action=END_SESSION sender="
+            .. tostring(sender)
+            .. " reason="
+            .. tostring(claimReason)
+            .. " neededAuth=host_claim"
+        )
+      end
+      return
+    end
+  end
+  if self.EndSession then
+    self:EndSession({ skipPermission = true, skipRequestLog = true })
+    LogAdminRequestApply(self, "END_SESSION")
+  end
+end
+
+function GLD:HandleEndSessionMessage(sender, payload)
+  if not payload then
+    return
+  end
+  if not IsInRaid() then
+    return
+  end
+  if self.IsSenderInRaid and not self:IsSenderInRaid(sender) then
+    return
+  end
+  local localSessionId = self.GetSessionId and self:GetSessionId() or nil
+  if payload.sessionId and localSessionId and payload.sessionId ~= localSessionId then
+    return
+  end
+
+  if self.LilyDebug then
+    self:LilyDebug(
+      string.format(
+        "[SESSION] RX END_SESSION from %s sessionId=%s",
+        tostring(sender),
+        tostring(payload.sessionId or "nil")
+      )
+    )
+  end
+
+  if self.EndSession then
+    self:EndSession({
+      force = true,
+      skipPermission = true,
+      skipAudit = true,
+      skipBroadcast = true,
+      skipEndMessage = true,
+      skipRequestLog = true,
+      skipLog = true,
+    })
+  end
 end
 
 function GLD:BroadcastNotice(id, text, options)
@@ -1024,42 +1768,692 @@ function GLD:HandleRevisionCheck(sender, payload)
   end
 end
 
-function GLD:HandleAdminRequest(sender, payload)
-  if not self:IsAuthority() then
-    return
-  end
+function GLD:HandleAdminRequest(sender, payload, distribution)
   if not payload or not payload.action then
     return
   end
-  local ok, reason = false, "missing validation"
+  local action = payload.action
+  if self.IsDebugEnabled and self:IsDebugEnabled() then
+    self:Debug(
+      "[AdminReqRecv] action="
+        .. tostring(action)
+        .. " sender="
+        .. tostring(sender)
+        .. " channel="
+        .. tostring(distribution or "UNKNOWN")
+    )
+  end
+  local canProcess, processReason, gateDetails = self:CanProcessAdminRequest(action)
+  if not canProcess then
+    if self.IsDebugEnabled and self:IsDebugEnabled() then
+      self:Debug(
+        "[AdminReqGate] action="
+          .. tostring(action)
+          .. " sender="
+          .. tostring(sender)
+          .. " decision=deny reason="
+          .. tostring(processReason)
+          .. " "
+          .. BuildAdminReqGateLabel(gateDetails)
+      )
+      self:Debug(
+        "[AdminReqReject] action="
+          .. tostring(action)
+          .. " sender="
+          .. tostring(sender)
+          .. " reason="
+          .. tostring(processReason)
+          .. " neededAuth=local_authority_or_elected"
+          .. " "
+          .. BuildAdminReqGateLabel(gateDetails)
+      )
+    end
+    return
+  end
+  local ok, reason, authDetails = false, "missing validation", nil
   if self.ValidateAdminRequestSender then
-    ok, reason = self:ValidateAdminRequestSender(sender, payload.action)
+    ok, reason, authDetails = self:ValidateAdminRequestSender(sender, payload.action)
   end
   if not ok then
     local label = reason or "rejected"
     self:Print("Admin request rejected from " .. tostring(sender) .. ": " .. tostring(label))
+    if self.IsDebugEnabled and self:IsDebugEnabled() then
+      self:Debug(
+        "[AdminReqReject] action="
+          .. tostring(action)
+          .. " sender="
+          .. tostring(sender)
+          .. " reason="
+          .. tostring(label)
+          .. " neededAuth=authority_manager"
+          .. " senderAuth="
+          .. FormatSenderAuth(authDetails)
+      )
+    end
     return
   end
-  local action = payload.action
+  if self.IsDebugEnabled and self:IsDebugEnabled() then
+    self:Debug(
+      "[AdminReqAccept] action="
+        .. tostring(action)
+        .. " sender="
+        .. tostring(sender)
+        .. " senderAuth="
+        .. FormatSenderAuth(authDetails)
+        .. " processor="
+        .. tostring(processReason)
+    )
+  end
+  if not self:IsAuthority() then
+    local claimed, claimReason = self:EnsureAuthorityForAdminAction(action)
+    if not claimed then
+      if self.IsDebugEnabled and self:IsDebugEnabled() then
+        self:Debug(
+          "[AdminReqReject] action="
+            .. tostring(action)
+            .. " sender="
+            .. tostring(sender)
+            .. " reason="
+            .. tostring(claimReason)
+            .. " neededAuth=host_claim"
+        )
+      end
+      return
+    end
+  end
   if action == "START_SESSION" then
-    if self.PromptStartSession then
-      self:PromptStartSession()
-    elseif self.StartSession then
+    if self.StartSession then
       self:StartSession()
+      LogAdminRequestApply(self, action)
     end
     return
   end
   if action == "END_SESSION" then
-    if self.PromptEndSession then
-      self:PromptEndSession()
-    elseif self.EndSession then
-      self:EndSession()
+    if self.EndSession then
+      self:EndSession({ skipPermission = true, skipRequestLog = true })
+      LogAdminRequestApply(self, action)
     end
+    return
+  end
+  if action == "SET_PUGS_MODE" and self.SetPugsInRaid then
+    local enabled = payload.data and payload.data.enabled == true
+    self:SetPugsInRaid(enabled, {
+      skipPermission = true,
+      reason = "admin_request",
+      actorGuid = self.GetGuidForSender and self:GetGuidForSender(sender) or nil,
+      actorName = sender,
+    })
+    LogAdminRequestApply(self, action)
+    return
+  end
+  if action == "APPROVE_GUEST" and self.ApproveGuestCandidate then
+    self:ApproveGuestCandidate({
+      key = payload.data and payload.data.key,
+      guid = payload.data and payload.data.guid,
+      name = payload.data and payload.data.name,
+      realm = payload.data and payload.data.realm,
+      class = payload.data and payload.data.class,
+      fullName = payload.data and payload.data.fullName,
+    }, {
+      skipPermission = true,
+      skipRequest = true,
+      approvedBy = sender,
+      approvedByGuid = self.GetGuidForSender and self:GetGuidForSender(sender) or nil,
+    })
+    LogAdminRequestApply(self, action)
+    return
+  end
+  if action == "ROLL_CONFIRM_OBTAINED" and self.ConfirmPendingRoll then
+    self:ConfirmPendingRoll(
+      payload.data and payload.data.rollKey,
+      payload.data and payload.data.approvedWinnerGuid,
+      {
+        skipPermission = true,
+        requestSource = "admin_request",
+        actorGuid = self.GetGuidForSender and self:GetGuidForSender(sender) or nil,
+        actorName = sender,
+      }
+    )
+    LogAdminRequestApply(self, action)
+    return
+  end
+  if action == "ROLL_MARK_LOST" and self.MarkPendingRollLost then
+    self:MarkPendingRollLost(
+      payload.data and payload.data.rollKey,
+      {
+        skipPermission = true,
+        requestSource = "admin_request",
+        actorGuid = self.GetGuidForSender and self:GetGuidForSender(sender) or nil,
+        actorName = sender,
+      }
+    )
+    LogAdminRequestApply(self, action)
     return
   end
   if self.IsDebugEnabled and self:IsDebugEnabled() then
     self:Debug("Admin request ignored (unknown action): " .. tostring(action))
   end
+end
+
+local function BuildHistoryKey(raidId, revision)
+  return tostring(raidId or "nil") .. ":" .. tostring(revision or 0)
+end
+
+local function SplitHistoryChunks(serialized)
+  local chunks = {}
+  if not serialized or serialized == "" then
+    return chunks
+  end
+  for i = 1, #serialized, HISTORY_CHUNK_SIZE do
+    chunks[#chunks + 1] = serialized:sub(i, i + HISTORY_CHUNK_SIZE - 1)
+  end
+  return chunks
+end
+
+local function CopyLootEntry(entry)
+  if not entry then
+    return nil
+  end
+  return {
+    rollID = entry.rollID,
+    itemLink = entry.itemLink,
+    itemName = entry.itemName,
+    winnerKey = entry.winnerKey,
+    winnerName = entry.winnerName,
+    winnerShortName = entry.winnerShortName,
+    winnerClassToken = entry.winnerClassToken,
+    winnerIsGuest = entry.winnerIsGuest,
+    votes = entry.votes,
+    voteCounts = entry.voteCounts,
+    voteDetails = entry.voteDetails,
+    missingAtLock = entry.missingAtLock,
+    startedAt = entry.startedAt,
+    resolvedAt = entry.resolvedAt,
+    resolvedBy = entry.resolvedBy,
+    overrideBy = entry.overrideBy,
+    rollStatus = entry.rollStatus,
+    computedWinnerGuid = entry.computedWinnerGuid,
+    approvedWinnerGuid = entry.approvedWinnerGuid,
+    resolutionReason = entry.resolutionReason,
+    resultId = entry.resultId,
+    winnerVote = entry.winnerVote,
+    winningRoll = entry.winningRoll,
+    instructionOverride = entry.instructionOverride,
+    instructionVote = entry.instructionVote,
+    instructionText = entry.instructionText,
+    blizzNeedAllowed = entry.blizzNeedAllowed,
+    blizzGreedAllowed = entry.blizzGreedAllowed,
+    blizzTransmogAllowed = entry.blizzTransmogAllowed,
+  }
+end
+
+local function CopyBossEntry(boss)
+  if not boss then
+    return nil
+  end
+  local loot = {}
+  for i, item in ipairs(boss.loot or {}) do
+    loot[i] = CopyLootEntry(item)
+  end
+  return {
+    encounterID = boss.encounterID,
+    encounterName = boss.encounterName,
+    difficultyID = boss.difficultyID,
+    groupSize = boss.groupSize,
+    killedAt = boss.killedAt,
+    loot = loot,
+  }
+end
+
+local function CopyRaidSession(session, raidId, revision)
+  if not session then
+    return nil
+  end
+  local loot = {}
+  for i, item in ipairs(session.loot or {}) do
+    loot[i] = CopyLootEntry(item)
+  end
+  local bosses = {}
+  for i, boss in ipairs(session.bosses or {}) do
+    bosses[i] = CopyBossEntry(boss)
+  end
+  return {
+    id = raidId,
+    raidId = raidId,
+    revision = revision,
+    startedAt = session.startedAt,
+    endedAt = session.endedAt,
+    raidName = session.raidName,
+    instanceType = session.instanceType,
+    difficultyID = session.difficultyID,
+    difficultyName = session.difficultyName,
+    instanceID = session.instanceID,
+    bosses = bosses,
+    loot = loot,
+  }
+end
+
+function GLD:GetHistorySyncState()
+  self.historySync = self.historySync or {}
+  self.historySync.pending = self.historySync.pending or {}
+  self.historySync.chunks = self.historySync.chunks or {}
+  return self.historySync
+end
+
+function GLD:HistoryDebug(msg)
+  if self.LilyDebug then
+    self:LilyDebug(msg)
+  end
+end
+
+function GLD:BuildHistorySyncPayload(session)
+  if not session then
+    return nil
+  end
+  local raidId = session.raidId or session.id
+  if not raidId then
+    return nil
+  end
+  local revision = tonumber(session.revision) or 1
+  local compact = CopyRaidSession(session, raidId, revision)
+  return {
+    raidId = raidId,
+    revision = revision,
+    session = compact,
+  }
+end
+
+function GLD:FindRaidSessionById(raidId)
+  if not raidId or not self.db or not self.db.raidSessions then
+    return nil, nil
+  end
+  for i, entry in ipairs(self.db.raidSessions) do
+    if entry and (entry.id == raidId or entry.raidId == raidId) then
+      return i, entry
+    end
+  end
+  return nil, nil
+end
+
+function GLD:SendHistoryChunks(historyPayload, target, msgId)
+  if not historyPayload then
+    return false
+  end
+  local raidId = historyPayload.raidId
+  local revision = historyPayload.revision
+  if not raidId then
+    return false
+  end
+  local serialized = self:Serialize(historyPayload)
+  if not serialized then
+    return false
+  end
+  local chunks = SplitHistoryChunks(serialized)
+  if #chunks == 0 then
+    chunks[1] = serialized
+  end
+  local channel = target and "WHISPER" or "RAID"
+  local token = msgId or BuildHistoryKey(raidId, revision)
+  for i, chunk in ipairs(chunks) do
+    self:SendCommMessageSafe(NS.MSG.HISTORY_DATA, {
+      raidId = raidId,
+      revision = revision,
+      msgId = token,
+      part = i,
+      total = #chunks,
+      data = chunk,
+    }, channel, target)
+  end
+  return true
+end
+
+function GLD:QueueHistorySend(historyPayload, target)
+  if not historyPayload or not target or target == "" then
+    return
+  end
+  local raidId = historyPayload.raidId
+  local revision = historyPayload.revision
+  if not raidId then
+    return
+  end
+  local state = self:GetHistorySyncState()
+  local key = BuildHistoryKey(raidId, revision)
+  local pending = state.pending[key]
+  if not pending then
+    pending = {
+      historyPayload = historyPayload,
+      recipients = {},
+      msgId = key,
+    }
+    state.pending[key] = pending
+  else
+    pending.historyPayload = historyPayload
+  end
+  local recipient = pending.recipients[target]
+  if not recipient then
+    recipient = { acked = false, resendAttempts = 0 }
+    pending.recipients[target] = recipient
+  else
+    recipient.acked = false
+    recipient.resendAttempts = 0
+  end
+  self:SendHistoryChunks(historyPayload, target, pending.msgId)
+  if C_Timer and C_Timer.After then
+    C_Timer.After(HISTORY_RESEND_DELAY, function()
+      if GLD and GLD.HandleHistoryResend then
+        GLD:HandleHistoryResend(raidId, revision, target)
+      end
+    end)
+  end
+end
+
+function GLD:HandleHistoryResend(raidId, revision, target)
+  local state = self:GetHistorySyncState()
+  local key = BuildHistoryKey(raidId, revision)
+  local pending = state.pending[key]
+  if not pending or not pending.recipients then
+    return
+  end
+  local recipient = pending.recipients[target]
+  if not recipient or recipient.acked then
+    return
+  end
+  if recipient.resendAttempts >= HISTORY_RESEND_MAX then
+    return
+  end
+  recipient.resendAttempts = recipient.resendAttempts + 1
+  self:HistoryDebug(
+    string.format(
+      "[HISTORY] RESEND raidId=%s rev=%s attempt=%d to=%s",
+      tostring(raidId),
+      tostring(revision),
+      recipient.resendAttempts,
+      tostring(target)
+    )
+  )
+  if pending.historyPayload then
+    self:SendHistoryChunks(pending.historyPayload, target, pending.msgId)
+  end
+  if C_Timer and C_Timer.After then
+    C_Timer.After(HISTORY_RESEND_DELAY, function()
+      if GLD and GLD.HandleHistoryResend then
+        GLD:HandleHistoryResend(raidId, revision, target)
+      end
+    end)
+  end
+end
+
+function GLD:BroadcastHistoryEntry(raidSession)
+  if not raidSession then
+    return
+  end
+  if not IsInRaid() then
+    return
+  end
+  local isHistoryOwner = self.IsHistoryAuthority and self:IsHistoryAuthority()
+  local isSessionAuthority = self.IsAuthority and self:IsAuthority()
+  if not isHistoryOwner and not isSessionAuthority then
+    return
+  end
+  local payload = self:BuildHistorySyncPayload(raidSession)
+  if not payload then
+    return
+  end
+  local recipients = {}
+  local recipientSet = {}
+  if self.GetRaidOfficerUnits then
+    for _, unit in ipairs(self:GetRaidOfficerUnits()) do
+      if not UnitIsUnit(unit, "player") then
+        local name = self:GetUnitFullName(unit) or UnitName(unit)
+        if name and name ~= "" then
+          if not recipientSet[name] then
+            recipientSet[name] = true
+            recipients[#recipients + 1] = name
+          end
+        end
+      end
+    end
+  end
+  if self.GetHistoryAuthorityUnit then
+    local ownerUnit = self:GetHistoryAuthorityUnit()
+    if ownerUnit and not UnitIsUnit(ownerUnit, "player") then
+      local ownerName = self:GetUnitFullName(ownerUnit) or UnitName(ownerUnit)
+      if ownerName and ownerName ~= "" and not recipientSet[ownerName] then
+        recipientSet[ownerName] = true
+        recipients[#recipients + 1] = ownerName
+      end
+    end
+  end
+  self:HistoryDebug(
+    string.format(
+      "[HISTORY] Finalized raidId=%s rev=%s sendingTo=%d",
+      tostring(payload.raidId),
+      tostring(payload.revision),
+      #recipients
+    )
+  )
+  for _, target in ipairs(recipients) do
+    self:QueueHistorySend(payload, target)
+  end
+end
+
+function GLD:HandleHistoryData(sender, payload)
+  if not payload or not payload.raidId then
+    return
+  end
+  if self.CanAccessAdminUI and not self:CanAccessAdminUI() then
+    if not (self.IsHistoryAuthority and self:IsHistoryAuthority()) then
+      return
+    end
+  end
+  if self.IsSenderInRaid and not self:IsSenderInRaid(sender) then
+    return
+  end
+  if self.IsOfficerSender and not self:IsOfficerSender(sender) then
+    local allow = false
+    if self.GetHistoryAuthorityUnit and self.GetUnitForSender then
+      local authorityUnit = self:GetHistoryAuthorityUnit()
+      local senderUnit = self:GetUnitForSender(sender)
+      if authorityUnit and senderUnit and UnitIsUnit(authorityUnit, senderUnit) then
+        allow = true
+      end
+    end
+    if not allow then
+      return
+    end
+  end
+  local state = self:GetHistorySyncState()
+  if payload.part and payload.total and payload.data then
+    local part = tonumber(payload.part)
+    local total = tonumber(payload.total)
+    if not part or not total or total < 1 then
+      return
+    end
+    local msgId = payload.msgId or BuildHistoryKey(payload.raidId, payload.revision)
+    local key = tostring(sender) .. ":" .. tostring(msgId)
+    local chunkState = state.chunks[key]
+    local now = GetServerTime()
+    if not chunkState or (chunkState.startedAt and now - chunkState.startedAt > HISTORY_CHUNK_TIMEOUT) then
+      chunkState = {
+        raidId = payload.raidId,
+        revision = payload.revision,
+        total = total,
+        parts = {},
+        received = 0,
+        startedAt = now,
+      }
+      state.chunks[key] = chunkState
+    end
+    if total ~= chunkState.total then
+      chunkState.total = total
+      chunkState.parts = {}
+      chunkState.received = 0
+      chunkState.startedAt = now
+    end
+    if not chunkState.parts[part] then
+      chunkState.parts[part] = payload.data
+      chunkState.received = chunkState.received + 1
+    end
+    if chunkState.received >= chunkState.total then
+      local assembled = {}
+      for i = 1, chunkState.total do
+        assembled[i] = chunkState.parts[i] or ""
+      end
+      state.chunks[key] = nil
+      local combined = table.concat(assembled)
+      local ok, data = self:Deserialize(combined)
+      if ok and data then
+        self:ApplyHistoryPayload(sender, data)
+      end
+    end
+    return
+  end
+  self:ApplyHistoryPayload(sender, payload)
+end
+
+function GLD:ApplyHistoryPayload(sender, payload)
+  if not payload or not payload.raidId or not payload.session then
+    return
+  end
+  if not self.db then
+    return
+  end
+  self.db.raidSessions = self.db.raidSessions or {}
+  local raidId = payload.raidId
+  local revision = tonumber(payload.revision) or 0
+  local session = payload.session
+  session.raidId = raidId
+  session.id = session.id or raidId
+  session.revision = revision
+  session.loot = session.loot or {}
+  session.bosses = session.bosses or {}
+  local index, existing = self:FindRaidSessionById(raidId)
+  local action = "IGNORED"
+  if not existing then
+    table.insert(self.db.raidSessions, 1, session)
+    action = "SAVED"
+  else
+    local localRev = tonumber(existing.revision) or 0
+    if localRev < revision then
+      self.db.raidSessions[index] = session
+      action = "UPDATED"
+    end
+  end
+  self:HistoryDebug(
+    string.format(
+      "[HISTORY] RX raidId=%s rev=%s from=%s action=%s",
+      tostring(raidId),
+      tostring(revision),
+      tostring(sender),
+      tostring(action)
+    )
+  )
+  if sender and sender ~= "" then
+    self:SendCommMessageSafe(NS.MSG.HISTORY_ACK, { raidId = raidId, revision = revision }, "WHISPER", sender)
+  end
+  if self.UI and self.UI.RefreshHistoryIfOpen then
+    self.UI:RefreshHistoryIfOpen()
+  end
+end
+
+function GLD:HandleHistoryAck(sender, payload)
+  if not payload or not payload.raidId then
+    return
+  end
+  local raidId = payload.raidId
+  local revision = payload.revision
+  local state = self:GetHistorySyncState()
+  local key = BuildHistoryKey(raidId, revision)
+  local pending = state.pending[key]
+  if not pending or not pending.recipients then
+    return
+  end
+  local recipient = pending.recipients[sender]
+  if not recipient and sender then
+    local base = sender:match("^[^%-]+")
+    if base then
+      base = base:lower()
+      for name in pairs(pending.recipients) do
+        local compare = name:match("^[^%-]+")
+        if compare and compare:lower() == base then
+          recipient = pending.recipients[name]
+          sender = name
+          break
+        end
+      end
+    end
+  end
+  if not recipient then
+    return
+  end
+  recipient.acked = true
+  self:HistoryDebug(
+    string.format(
+      "[HISTORY] ACK raidId=%s rev=%s from=%s",
+      tostring(raidId),
+      tostring(revision),
+      tostring(sender)
+    )
+  )
+  local allAcked = true
+  for _, entry in pairs(pending.recipients) do
+    if not entry.acked then
+      allAcked = false
+      break
+    end
+  end
+  if allAcked then
+    state.pending[key] = nil
+  end
+end
+
+function GLD:HandleHistoryRequest(sender, payload)
+  if not sender or sender == "" then
+    return
+  end
+  if not self.IsHistoryAuthority or not self:IsHistoryAuthority() then
+    return
+  end
+  if self.IsOfficerSender and not self:IsOfficerSender(sender) then
+    return
+  end
+  local raidId = payload and payload.raidId or nil
+  if not raidId or raidId == "" then
+    local latest = self.db and self.db.raidSessions and self.db.raidSessions[1]
+    raidId = latest and (latest.raidId or latest.id) or nil
+  end
+  if not raidId then
+    return
+  end
+  self:HistoryDebug(
+    string.format(
+      "[HISTORY] REQ raidId=%s from=%s",
+      tostring(raidId),
+      tostring(sender)
+    )
+  )
+  local _, entry = self:FindRaidSessionById(raidId)
+  if not entry then
+    return
+  end
+  local payloadData = self:BuildHistorySyncPayload(entry)
+  if payloadData then
+    self:QueueHistorySend(payloadData, sender)
+  end
+end
+
+function GLD:RequestHistory(raidId)
+  if not IsInRaid() then
+    return false
+  end
+  if self.CanAccessAdminUI and not self:CanAccessAdminUI() then
+    return false
+  end
+  self:SendCommMessageSafe(NS.MSG.HISTORY_REQ, {
+    raidId = raidId,
+    requestedAt = GetServerTime(),
+  }, "RAID")
+  return true
 end
 
 function GLD:HandleRollSession(sender, payload)
@@ -1089,27 +2483,24 @@ function GLD:HandleRollSession(sender, payload)
 
   local isTest = payload.test == true
   if not isTest then
-    local sessionActive = nil
-    local sessionSource = "unknown"
-    if self.shadow and self.shadow.sessionActive ~= nil then
-      sessionActive = self.shadow.sessionActive == true
-      sessionSource = "shadow"
-    elseif self:IsAuthority() then
-      sessionActive = self.db and self.db.session and self.db.session.active == true
-      sessionSource = "authority-db"
-    end
-    if sessionActive == nil then
-      sessionActive = true
-      sessionSource = "default"
-    end
+    local gateEnabled = self.IsEnabled and self:IsEnabled()
+    local sessionActive = self.IsSessionActive and self:IsSessionActive()
     if not IsInRaid() then
       if debugEnabled then
         self:Debug("Roll session ignored: not in raid.")
       end
       return
     end
-    if sessionActive == false and debugEnabled then
-      self:Debug("Roll session received while sessionActive=false (source=" .. tostring(sessionSource) .. ").")
+    if not gateEnabled or not sessionActive then
+      if debugEnabled then
+        self:Debug(
+          "Roll session ignored: loot gate disabled enabled="
+            .. tostring(gateEnabled)
+            .. " sessionActive="
+            .. tostring(sessionActive)
+        )
+      end
+      return
     end
     if self.IsAuthorizedSender then
       local ok = self:IsAuthorizedSender(sender, payload.authorityGUID, payload.authorityName)
@@ -1213,11 +2604,32 @@ function GLD:HandleRollSession(sender, payload)
     session.expectedVoterClasses = payload.expectedVoterClasses
   end
   session.createdAt = payload.createdAt or session.createdAt or GetServerTime()
+  session.status = (payload.status and tostring(payload.status):upper()) or session.status or "ACTIVE"
+  if payload.computedWinnerGuid ~= nil then
+    session.computedWinnerGuid = payload.computedWinnerGuid
+  end
+  if payload.approvedWinnerGuid ~= nil then
+    session.approvedWinnerGuid = payload.approvedWinnerGuid
+  end
+  if payload.resolutionReason ~= nil then
+    session.resolutionReason = payload.resolutionReason
+  end
+  if payload.computedResult then
+    session.computedResult = payload.computedResult
+  end
+  if session.status == "PENDING_APPROVAL" or session.status == "APPROVED" or session.status == "LOST" or session.status == "CLOSED" then
+    session.locked = true
+  elseif payload.locked ~= nil then
+    session.locked = payload.locked == true
+  end
   if payload.votes then
     session.votes = session.votes or {}
     for k, v in pairs(payload.votes) do
       session.votes[k] = v
     end
+  end
+  if self.SyncLocalVoteState then
+    self:SyncLocalVoteState(session)
   end
 
   if debugEnabled then
@@ -1265,13 +2677,13 @@ function GLD:HandleRollSession(sender, payload)
     self:Debug("Roll session tracked: rollID=" .. tostring(rollID) .. " rollKey=" .. tostring(rollKey) .. " active=" .. tostring(count))
   end
 
-  if not isTest and self:IsAuthority() and not session.timerStarted then
+  if not isTest and self:IsAuthority() and not session.timerStarted and (self.GetRollStatus and self:GetRollStatus(session) == "ACTIVE") then
     session.timerStarted = true
     local delay = (tonumber(payload.rollTime) or 120000) / 1000
     C_Timer.After(delay, function()
       local activeKey = session and session.rollKey
       local active = self.activeRolls and activeKey and self.activeRolls[activeKey] or nil
-      if active and not active.locked then
+      if active and not active.locked and (not self.GetRollStatus or self:GetRollStatus(active) == "ACTIVE") then
         self:FinalizeRoll(active)
       end
     end)
@@ -1299,10 +2711,12 @@ function GLD:HandleRollSession(sender, payload)
   end
 
   if self.UI and self.UI.RefreshLootWindow then
-    local options = { forceShow = true }
-    if payload.reopen == true then
-      options.reopen = true
-    end
+    local options = {
+      forceShow = true,
+      reopen = payload.reopen == true,
+      onlyIfPending = true,
+      trigger = payload.reopen == true and "force" or "auto",
+    }
     self.UI:RefreshLootWindow(options)
     if debugEnabled then
       self:Debug("Loot window refresh: forceShow=true reopen=" .. tostring(payload.reopen == true))
@@ -1319,6 +2733,9 @@ end
 
 function GLD:HandleRollVote(sender, payload)
   if not payload then
+    return
+  end
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
     return
   end
 
@@ -1365,6 +2782,19 @@ function GLD:HandleRollVote(sender, payload)
     end
     return
   end
+  if self.GetRollStatus and self:GetRollStatus(session) ~= "ACTIVE" then
+    if debugEnabled then
+      self:Debug(
+        "Vote ignored (roll not active): rollID="
+          .. tostring(rollID)
+          .. " rollKey="
+          .. tostring(rollKey)
+          .. " status="
+          .. tostring(self:GetRollStatus(session))
+      )
+    end
+    return
+  end
   if session.locked then
     if debugEnabled then
       self:Debug("Vote ignored (session locked): rollID=" .. tostring(rollID) .. " rollKey=" .. tostring(rollKey))
@@ -1391,6 +2821,19 @@ function GLD:HandleRollVote(sender, payload)
           .. tostring(rollKey)
           .. " sender="
           .. tostring(sender)
+      )
+    end
+    return
+  end
+  if isAuthority and self.IsTrackedPlayerKey and not self:IsTrackedPlayerKey(key, { allowGuildLookup = true }) then
+    if debugEnabled then
+      self:Debug(
+        "Vote ignored: untracked voter for rollID="
+          .. tostring(rollID)
+          .. " rollKey="
+          .. tostring(rollKey)
+          .. " voter="
+          .. tostring(key)
       )
     end
     return
@@ -1430,6 +2873,9 @@ function GLD:HandleRollVote(sender, payload)
     reason = reason,
     reasonText = reasonText,
   }
+  if self.SyncLocalVoteState then
+    self:SyncLocalVoteState(session)
+  end
   if isAuthority and effectiveVote ~= originalVote then
     reasonText = self.GetEligibilityReasonText and self:GetEligibilityReasonText(reason, session) or nil
     session.voteDetails[key].reasonText = reasonText
@@ -1506,8 +2952,123 @@ function GLD:HandleRollVote(sender, payload)
   end
 end
 
+function GLD:HandleRollPendingApproval(sender, payload)
+  if not payload then
+    return
+  end
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
+  if self.IsAuthorizedSender then
+    local ok = self:IsAuthorizedSender(sender, payload.authorityGUID, payload.authorityName)
+    if not ok then
+      self:Debug("Blocked unauthorized pending-approval update from " .. tostring(sender))
+      return
+    end
+  end
+  local rollID = payload.rollID
+  local rollKey = DeriveRollKey(self, payload)
+  if not rollKey then
+    return
+  end
+  self.activeRolls = self.activeRolls or {}
+  local sessionKey, session = self.FindActiveRoll and self:FindActiveRoll(rollKey, rollID)
+  if not session then
+    sessionKey = rollKey
+    session = {
+      rollID = rollID,
+      rollKey = rollKey,
+      votes = {},
+    }
+    self.activeRolls[sessionKey] = session
+  end
+  session.status = "PENDING_APPROVAL"
+  session.locked = true
+  session.computedWinnerGuid = payload.computedWinnerGuid or session.computedWinnerGuid
+  session.resolutionReason = payload.resolutionReason or session.resolutionReason
+  if payload.itemLink then
+    session.itemLink = payload.itemLink
+  end
+  if payload.itemName then
+    session.itemName = payload.itemName
+  end
+  if payload.votes then
+    session.votes = session.votes or {}
+    for k, v in pairs(payload.votes) do
+      session.votes[k] = v
+    end
+  end
+  if payload.computedResult then
+    session.computedResult = payload.computedResult
+  end
+  if self.IsDebugEnabled and self:IsDebugEnabled() then
+    self:Debug(
+      "Roll pending approval: rollID="
+        .. tostring(rollID)
+        .. " rollKey="
+        .. tostring(rollKey)
+        .. " computedWinner="
+        .. tostring(session.computedWinnerGuid)
+    )
+  end
+  if self.UI and self.UI.RefreshLootWindow then
+    self.UI:RefreshLootWindow({ forceShow = true, reopen = true, onlyIfPending = true, trigger = "force" })
+  end
+end
+
+function GLD:HandleRollApproved(sender, payload)
+  if not payload then
+    return
+  end
+  if self.IsAuthorizedSender then
+    local ok = self:IsAuthorizedSender(sender, payload.authorityGUID, payload.authorityName)
+    if not ok then
+      self:Debug("Blocked unauthorized roll-approved update from " .. tostring(sender))
+      return
+    end
+  end
+  local rollID = payload.rollID
+  local rollKey = DeriveRollKey(self, payload)
+  local _, session = self.FindActiveRoll and self:FindActiveRoll(rollKey, rollID)
+  if session then
+    session.status = "APPROVED"
+    session.approvedWinnerGuid = payload.approvedWinnerGuid or session.approvedWinnerGuid
+    session.locked = true
+  end
+  if self.UI and self.UI.RefreshLootWindow then
+    self.UI:RefreshLootWindow()
+  end
+end
+
+function GLD:HandleRollLost(sender, payload)
+  if not payload then
+    return
+  end
+  if self.IsAuthorizedSender then
+    local ok = self:IsAuthorizedSender(sender, payload.authorityGUID, payload.authorityName)
+    if not ok then
+      self:Debug("Blocked unauthorized roll-lost update from " .. tostring(sender))
+      return
+    end
+  end
+  local rollID = payload.rollID
+  local rollKey = DeriveRollKey(self, payload)
+  local _, session = self.FindActiveRoll and self:FindActiveRoll(rollKey, rollID)
+  if session then
+    session.status = "LOST"
+    session.locked = true
+    session.resolutionReason = "LOST"
+  end
+  if self.UI and self.UI.RefreshLootWindow then
+    self.UI:RefreshLootWindow()
+  end
+end
+
 function GLD:HandleRollResult(sender, payload)
   if not payload then
+    return
+  end
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
     return
   end
   if self.ClearCoverOverridesForRoll then
@@ -1520,6 +3081,17 @@ function GLD:HandleRollResult(sender, payload)
       self:Debug("Blocked unauthorized roll result from " .. tostring(sender))
       return
     end
+  end
+  local dedupKey = BuildRollResultDedupKey(payload)
+  self._processedRollResults = self._processedRollResults or {}
+  if dedupKey and self._processedRollResults[dedupKey] then
+    if debugEnabled then
+      self:Debug("Duplicate roll result ignored: " .. tostring(dedupKey))
+    end
+    return
+  end
+  if dedupKey then
+    self._processedRollResults[dedupKey] = true
   end
   local rollID = payload.rollID
   local rollKey = DeriveRollKey(self, payload)
@@ -1538,14 +3110,33 @@ function GLD:HandleRollResult(sender, payload)
   if session then
     session.locked = true
     session.result = payload
+    if payload.rollStatus then
+      session.status = tostring(payload.rollStatus):upper()
+    elseif payload.resolutionReason == "LOST" then
+      session.status = "LOST"
+    else
+      session.status = "CLOSED"
+    end
+    session.approvedWinnerGuid = payload.approvedWinnerGuid or session.approvedWinnerGuid
+    session.computedWinnerGuid = payload.computedWinnerGuid or session.computedWinnerGuid
+    session.resolutionReason = payload.resolutionReason or session.resolutionReason
   end
   self:RecordRollHistory(payload)
   local itemLabel = tostring(payload.itemName or payload.itemLink or "Item")
   local winnerLabel = tostring(payload.winnerName or "None")
+  if payload.resolutionReason == "LOST" or payload.rollStatus == "LOST" then
+    winnerLabel = "LOST/VOID"
+  end
   local detail = ""
   if payload.resolvedBy == "OVERRIDE" then
     local by = payload.overrideBy or payload.authorityName or sender or "Authority"
     detail = " (override by " .. tostring(by) .. ")"
+  elseif payload.resolutionReason == "LOST" or payload.rollStatus == "LOST" then
+    local by = payload.markedByName or payload.authorityName or sender or "Authority"
+    detail = " (marked lost by " .. tostring(by) .. ")"
+  elseif payload.resolutionReason == "CONFIRMED_OBTAINED" then
+    local by = payload.approvedByName or payload.authorityName or sender or "Authority"
+    detail = " (approved by " .. tostring(by) .. ")"
   end
   self:TraceStep("Winner decided: " .. itemLabel .. " -> " .. winnerLabel .. detail)
   if debugEnabled then
@@ -1564,18 +3155,23 @@ function GLD:HandleRollResult(sender, payload)
     end
     self:Debug("Roll result pruned: rollID=" .. tostring(rollID) .. " rollKey=" .. tostring(rollKey) .. " active=" .. tostring(count))
   end
+  local localKey = NS.GetPlayerKeyFromUnit and NS:GetPlayerKeyFromUnit("player") or nil
+  local localFull = self.GetUnitFullName and self:GetUnitFullName("player") or nil
+  local localShort = UnitName("player")
+  local isWinner = false
+  if localKey and payload.winnerKey and payload.winnerKey == localKey then
+    isWinner = true
+  elseif localFull and payload.winnerName and payload.winnerName == localFull then
+    isWinner = true
+  elseif localShort and payload.winnerShortName and payload.winnerShortName == localShort then
+    isWinner = true
+  end
+
+  if self.ApplyCoverOutcomeForResult then
+    self:ApplyCoverOutcomeForResult(payload, isWinner)
+  end
+
   if self.UI and self.UI.ShowRollResultPopup then
-    local localKey = NS.GetPlayerKeyFromUnit and NS:GetPlayerKeyFromUnit("player") or nil
-    local localFull = self.GetUnitFullName and self:GetUnitFullName("player") or nil
-    local localShort = UnitName("player")
-    local isWinner = false
-    if localKey and payload.winnerKey and payload.winnerKey == localKey then
-      isWinner = true
-    elseif localFull and payload.winnerName and payload.winnerName == localFull then
-      isWinner = true
-    elseif localShort and payload.winnerShortName and payload.winnerShortName == localShort then
-      isWinner = true
-    end
 
     local function CountQueueFromRoster(roster)
       local count = 0
@@ -1698,6 +3294,9 @@ function GLD:HandleVoteConverted(sender, payload)
   if not payload then
     return
   end
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
   local targetKey = payload.voterKey
   if targetKey then
     local localKey = NS.GetPlayerKeyFromUnit and NS:GetPlayerKeyFromUnit("player") or nil
@@ -1724,6 +3323,9 @@ end
 
 function GLD:HandleRollAck(sender, payload)
   if not payload then
+    return
+  end
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
     return
   end
   if not self:IsAuthority() then
@@ -1776,6 +3378,9 @@ function GLD:HandleRollAck(sender, payload)
 end
 
 function GLD:HandleRollSessionRequest(sender, payload)
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
   if not self:IsAuthority() then
     return
   end
@@ -1789,10 +3394,16 @@ function GLD:HandleRollSessionRequest(sender, payload)
     return
   end
   if not payload then
-    return
+    payload = {}
   end
   local rollID = payload.rollID
   local rollKey = DeriveRollKey(self, payload)
+  if rollID == nil and (not rollKey or rollKey == "") then
+    if self.BroadcastActiveRollsSnapshot then
+      self:BroadcastActiveRollsSnapshot(nil, { reopen = true })
+    end
+    return
+  end
   local _, session = self.FindActiveRoll and self:FindActiveRoll(rollKey, rollID)
   if not session then
     session = self.activeRolls and rollKey and self.activeRolls[rollKey] or nil
@@ -1835,6 +3446,9 @@ function GLD:HandleRollMismatch(sender, payload)
 end
 
 function GLD:HandleForcePending(sender, payload)
+  if (self.IsEnabled and not self:IsEnabled()) or (self.IsSessionActive and not self:IsSessionActive()) then
+    return
+  end
   if self.IsAuthorizedSender then
     local ok = self:IsAuthorizedSender(sender, payload and payload.authorityGUID, payload and payload.authorityName)
     if not ok then
@@ -1843,9 +3457,9 @@ function GLD:HandleForcePending(sender, payload)
     end
   end
   if self.UI and self.UI.ShowPendingFrame then
-    self.UI:ShowPendingFrame()
+    self.UI:ShowPendingFrame({ onlyIfPending = true, trigger = "force", reopen = true })
   elseif self.UI and self.UI.RefreshLootWindow then
-    self.UI:RefreshLootWindow({ forceShow = true })
+    self.UI:RefreshLootWindow({ forceShow = true, onlyIfPending = true, trigger = "force", reopen = true })
   end
   local fromName = payload and (payload.authorityName or sender) or sender
   self:TraceStep("Pending votes window requested by " .. tostring(fromName))
